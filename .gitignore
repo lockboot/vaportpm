@@ -1,0 +1,15 @@
+/target
+Cargo.lock
+.ssh
+.rustup
+.gnupg
+.dotnet
+.cache
+.vscode-server
+.claude.json
+.claude.json.backup.*
+.local
+.claude
+.config
+.gitconfig
+.cargo

@@ -1,0 +1,40 @@
+[workspace]
+members = ["crates/vaportpm-attest", "crates/vaportpm-verify"]
+resolver = "2"
+
+[workspace.package]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_bytes = "0.11"
+base64 = "0.22"
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+anyhow = "1.0"
+thiserror = "1.0"
+hex = "0.4"
+
+# X.509 and crypto for verification
+der = { version = "0.7", features = ["alloc", "pem", "oid"] }
+spki = { version = "0.7", features = ["alloc"] }
+x509-cert = { version = "0.2", features = ["pem"] }
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+p384 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+ecdsa = { version = "0.16", features = ["verifying", "der"] }
+coset = "0.3"
+ciborium = "0.2"
+
+# Certificate chain validation (rustls ecosystem)
+rustls-rustcrypto = { version = "=0.0.2-alpha", default-features = false, features = ["std", "zeroize"] }
+webpki = { package = "rustls-webpki", version = "=0.102.8", default-features = false, features = ["alloc"] }
+pki-types = { package = "rustls-pki-types", version = "=1.13.0", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
