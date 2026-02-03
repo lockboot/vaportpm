@@ -13,15 +13,14 @@ der = { workspace = true }
 spki = { workspace = true }
 x509-cert = { workspace = true }
 
-# Certificate chain validation (rustls ecosystem)
-webpki = { workspace = true }
+# Time types
 pki-types = { workspace = true }
-rustls-rustcrypto = { workspace = true }
 
-# Signature verification (still needed for TPM AK signature)
+# Signature verification
 p256 = { workspace = true }
 p384 = { workspace = true }
 ecdsa = { workspace = true }
+rsa = { workspace = true }
 
 # COSE/CBOR for Nitro
 coset = { workspace = true }
@@ -40,9 +39,6 @@ name = "vaportpm_verify"
 path = "src/lib.rs"
 
 [[bin]]
-name = "selftest-verify"
-path = "src/bin/selftest-verify.rs"
+name = "vaportpm-verify"
+path = "src/bin/verify.rs"
 
-[[bin]]
-name = "test-verify"
-path = "src/bin/test-verify.rs"

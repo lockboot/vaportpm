@@ -16,9 +16,9 @@ By combining these, we get a chain of trust from AWS hardware to arbitrary appli
 ```mermaid
 flowchart TD
     A["<b>AWS Nitro Root CA</b><br/>Verification returns root pubkey hash"]
-    B["<b>Nitro Attestation Document</b><br/>COSE Sign1 structure containing:<br/>• nitrotpm_pcrs: SHA-384 PCR values<br/>• public_key: Application key binding<br/>• nonce: Freshness proof<br/>• Certificate chain to AWS root"]
-    C["<b>TPM Attestation Key (AK)</b><br/>• ECC P-256 signing key<br/>• authPolicy = PolicyPCR(SHA-384 bank)<br/>• Can only sign when PCRs match"]
-    D["<b>TPM2B_ATTEST</b><br/>• extraData: nonce (matches Nitro)<br/>• certifiedName: includes authPolicy<br/>• Proves: AK bound to PCR values"]
+    B["<b>Nitro Attestation Document</b><br/>COSE Sign1 structure containing:<br/>• nitrotpm_pcrs: SHA-384 PCR values<br/>• public_key: AK public key binding<br/>• nonce: Freshness proof<br/>• Certificate chain to AWS root"]
+    C["<b>TPM Attestation Key (AK)</b><br/>• ECC P-256 signing key<br/>• Long-term key (no PCR binding)<br/>• Bound to Nitro document via public_key"]
+    D["<b>TPM2_Quote (TPMS_ATTEST)</b><br/>• extraData: nonce (matches Nitro)<br/>• pcrDigest: hash of quoted PCRs<br/>• Proves: PCR values at quote time"]
 
     A -->|"Signs (ECDSA P-384)"| B
     B -->|"public_key field binds"| C
@@ -29,9 +29,9 @@ flowchart TD
 
 The Nitro document signs `nitrotpm_pcrs` which contains **SHA-384** PCR values. For a coherent chain of trust:
 
-- The AK's `authPolicy` references the SHA-384 PCR bank
-- Verification computes policy from SHA-384 PCRs
-- The signed Nitro PCRs match what the AK is bound to
+- TPM2_Quote includes SHA-384 PCRs in the signed attestation
+- The Nitro document contains signed SHA-384 PCR values
+- Verification compares the Quote's PCRs against the signed Nitro values
 
 This ensures a single, verifiable path from AWS hardware to the attested data.
 
@@ -40,26 +40,21 @@ This ensures a single, verifiable path from AWS hardware to the attested data.
 ### Generation (on Nitro instance)
 
 ```rust
-// 1. Detect Nitro and choose PCR bank
+// 1. Detect Nitro and read PCR values (SHA-384)
 let is_nitro = tpm.is_nitro_tpm()?;
-let pcr_alg = if is_nitro { TpmAlg::Sha384 } else { TpmAlg::Sha256 };
+let pcr_values = tpm.read_all_allocated_pcrs()?;  // Reads SHA-384 bank
 
-// 2. Read PCR values from chosen bank
-let pcr_values = tpm.read_pcrs(pcr_alg)?;
+// 2. Create restricted AK in endorsement hierarchy (TCG-compliant AK profile)
+let ak = tpm.create_restricted_ak(TPM_RH_ENDORSEMENT)?;
 
-// 3. Compute PCR policy digest
-let auth_policy = Tpm::calculate_pcr_policy_digest(&pcr_values, pcr_alg)?;
+// 3. Quote PCRs with AK (signs PCR values)
+// Note: nonce is caller-provided for freshness/replay protection
+let quote_result = tpm.quote(ak.handle, &nonce, &pcr_selection)?;
 
-// 4. Create AK bound to this policy
-let ak = tpm.create_primary_ecc_key_with_policy(TPM_RH_OWNER, &auth_policy)?;
-
-// 5. AK self-certifies (proves it exists with this policy)
-let certify_result = tpm.certify(ak.handle, ak.handle, &nonce)?;
-
-// 6. Get Nitro attestation binding the AK public key
+// 4. Get Nitro attestation binding the AK public key
 let nitro_doc = tpm.nsm_attest(
     None,                           // user_data
-    Some(nonce.to_vec()),          // nonce (same as TPM)
+    Some(nonce.to_vec()),          // nonce (same as TPM Quote)
     Some(ak_public_key_secg),      // public_key (binds AK)
 )?;
 ```
@@ -76,20 +71,14 @@ let nitro_result = verify_nitro_attestation(&nitro_doc)?;
 // 3. Verify AK public key matches Nitro's public_key binding
 assert!(ak_pubkey == nitro_result.document.public_key);
 
-// 4. Verify TPM signature over TPM2B_ATTEST
-verify_ecdsa_p256(&attest_data, &signature, &ak_pubkey)?;
+// 4. Verify TPM Quote signature
+verify_ecdsa_p256(&quote_attest_data, &signature, &ak_pubkey)?;
 
-// 5. Compute expected AK name from PCR policy
-let policy = calculate_pcr_policy(&sha384_pcrs, TpmAlg::Sha384)?;
-let expected_name = compute_ecc_p256_name(&ak_x, &ak_y, &policy);
+// 5. Verify nonces match (proves freshness and binding)
+let quote_info = parse_quote_attest(&quote_attest_data)?;
+assert!(quote_info.nonce == nitro_nonce);
 
-// 6. Verify certified name matches (proves PCR binding)
-assert!(attest_info.certified_name == expected_name);
-
-// 7. Verify nonces match (proves freshness and binding)
-assert!(tpm_nonce == nitro_nonce);
-
-// 8. Verify PCR values match signed Nitro document
+// 6. Verify PCR values match signed Nitro document
 assert!(output.pcrs["sha384"] == nitro_result.document.pcrs);
 ```
 
@@ -99,11 +88,11 @@ assert!(output.pcrs["sha384"] == nitro_result.document.pcrs);
 
 1. **Hardware Root of Trust** - The Nitro document is signed by AWS hardware (certificate chain to AWS root CA)
 
-2. **PCR Integrity** - The SHA-384 PCR values in the attestation match what AWS hardware measured
+2. **PCR Integrity** - The SHA-384 PCR values in the attestation match what AWS hardware measured (signed in Nitro document)
 
-3. **Key Binding** - The AK is bound to specific PCR values via `authPolicy` (it cannot sign unless PCRs match)
+3. **Key Binding** - The AK is bound to the Nitro document via the `public_key` field
 
-4. **Freshness** - The nonce in both TPM and Nitro attestations proves the attestation is fresh
+4. **Freshness** - The nonce in both TPM Quote and Nitro document proves the attestation is fresh
 
 5. **AK Authenticity** - The Nitro document's `public_key` field proves the AK belongs to this Nitro instance
 
@@ -193,7 +182,7 @@ COSE_Sign1 = [
 }
 ```
 
-Note: Only SHA-384 PCRs are included because that's the bank bound to the AK and signed in the Nitro document.
+Note: Only SHA-384 PCRs are included because that's the bank signed in the Nitro document.
 
 ## References
 

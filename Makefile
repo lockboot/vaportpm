@@ -8,6 +8,9 @@ build:
 release-x86:
 	cargo build --workspace --release --target x86_64-unknown-linux-musl
 
+release-aarch64:
+	cargo build --workspace --release --target aarch64-unknown-linux-musl
+
 check:
 	cargo check --workspace --all-targets
 

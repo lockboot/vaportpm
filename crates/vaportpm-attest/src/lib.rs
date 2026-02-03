@@ -10,22 +10,21 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 
 pub mod a9n;
-pub mod credential;
+pub mod cert;
 pub mod ek;
 pub mod nsm;
 pub mod nv;
 pub mod pcr;
+pub mod roots;
 
 // Re-export extension traits for convenience
-pub use ek::EkOps;
+pub use ek::KeyOps;
 pub use nsm::NsmOps;
 pub use nv::NvOps;
 pub use pcr::PcrOps;
 
-// Re-export credential functions
-pub use credential::{compute_ecc_p256_name, ReadPublicResult};
-
-pub use a9n::{attest, der_to_pem};
+pub use a9n::attest;
+pub use cert::{der_to_pem, extract_aki, extract_ski, pem_to_der};
 
 /// TPM 2.0 command codes
 #[repr(u32)]
@@ -72,6 +71,7 @@ pub enum TpmRc {
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TpmAlg {
+    Rsa = 0x0001,
     Sha1 = 0x0004,
     Sha256 = 0x000B,
     Sha384 = 0x000C,
@@ -80,6 +80,7 @@ pub enum TpmAlg {
     Cfb = 0x0043,
     Ecc = 0x0023,
     EcDsa = 0x0018,
+    RsaSsa = 0x0014,
     Null = 0x0010,
 }
 
@@ -98,6 +99,7 @@ impl TpmAlg {
     /// Get the algorithm name as a string
     pub fn name(&self) -> &'static str {
         match self {
+            TpmAlg::Rsa => "rsa",
             TpmAlg::Sha1 => "sha1",
             TpmAlg::Sha256 => "sha256",
             TpmAlg::Sha384 => "sha384",
@@ -106,6 +108,7 @@ impl TpmAlg {
             TpmAlg::Cfb => "cfb",
             TpmAlg::Ecc => "ecc",
             TpmAlg::EcDsa => "ecdsa",
+            TpmAlg::RsaSsa => "rsassa",
             TpmAlg::Null => "null",
         }
     }
@@ -113,12 +116,14 @@ impl TpmAlg {
     /// Try to convert a u16 to a TpmAlg
     pub fn from_u16(val: u16) -> Option<Self> {
         match val {
+            0x0001 => Some(TpmAlg::Rsa),
             0x0004 => Some(TpmAlg::Sha1),
             0x000B => Some(TpmAlg::Sha256),
             0x000C => Some(TpmAlg::Sha384),
             0x000D => Some(TpmAlg::Sha512),
             0x0023 => Some(TpmAlg::Ecc),
             0x0018 => Some(TpmAlg::EcDsa),
+            0x0014 => Some(TpmAlg::RsaSsa),
             0x0010 => Some(TpmAlg::Null),
             _ => None,
         }
@@ -585,15 +590,44 @@ pub struct EccPublicKey {
     pub y: Vec<u8>,
 }
 
+/// RSA public key information parsed from TPMT_PUBLIC
+#[derive(Debug, Clone)]
+pub struct RsaPublicKey {
+    pub key_type: u16,
+    pub name_alg: u16,
+    pub object_attributes: u32,
+    pub auth_policy: Vec<u8>,
+    pub symmetric: u16,
+    pub scheme: u16,
+    pub key_bits: u16,
+    pub exponent: u32,
+    pub modulus: Vec<u8>,
+}
+
+/// Generic public key that can be either RSA or ECC
+#[derive(Debug, Clone)]
+pub enum PublicKey {
+    Rsa(RsaPublicKey),
+    Ecc(EccPublicKey),
+}
+
 /// Result from creating a primary key
 pub struct PrimaryKeyResult {
     pub handle: u32,
     pub public_key: EccPublicKey,
 }
 
-/// Result from TPM2_Certify
+/// Result from creating a primary key from a template (may be RSA or ECC)
+pub struct TemplateKeyResult {
+    pub handle: u32,
+    pub public_key: PublicKey,
+    /// The raw TPM2B_PUBLIC bytes returned by the TPM
+    pub public_bytes: Vec<u8>,
+}
+
+/// Result from TPM2_Quote
 #[derive(Debug)]
-pub struct CertifyResult {
-    pub attest_data: Vec<u8>, // TPMS_ATTEST structure
+pub struct QuoteResult {
+    pub attest_data: Vec<u8>, // TPMS_ATTEST structure (type=QUOTE)
     pub signature: Vec<u8>,   // DER-encoded ECDSA signature
 }

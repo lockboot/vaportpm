@@ -16,7 +16,7 @@ use x509_cert::Certificate;
 use pki_types::UnixTime;
 
 use crate::error::VerifyError;
-use crate::x509::{extract_public_key, validate_cert_chain};
+use crate::x509::{extract_public_key, validate_tpm_cert_chain};
 
 /// Result of successful Nitro attestation verification
 ///
@@ -118,8 +118,10 @@ pub fn verify_nitro_attestation(
     let leaf_cert = Certificate::from_der(&cert_der)
         .map_err(|e| VerifyError::CertificateParse(format!("Invalid leaf cert: {}", e)))?;
 
+    // Build chain in leaf-to-root order
+    // AWS cabundle is ordered [root, ..., issuer], so we reverse it
     let mut chain = vec![leaf_cert];
-    for ca_der in cabundle {
+    for ca_der in cabundle.into_iter().rev() {
         let ca_cert = Certificate::from_der(&ca_der)
             .map_err(|e| VerifyError::CertificateParse(format!("Invalid CA cert: {}", e)))?;
         chain.push(ca_cert);
@@ -130,9 +132,9 @@ pub fn verify_nitro_attestation(
     let leaf_pubkey = extract_public_key(&chain[0])?;
     verify_cose_signature(&cose_sign1, &leaf_pubkey, payload)?;
 
-    // Validate certificate chain using webpki
-    // This validates signatures, dates, and returns root's public key hash
-    let chain_result = validate_cert_chain(&chain, time)?;
+    // Validate certificate chain
+    // This validates signatures, dates, extensions, and returns root's public key hash
+    let chain_result = validate_tpm_cert_chain(&chain, time)?;
     let root_pubkey_hash = chain_result.root_pubkey_hash;
 
     Ok(NitroVerifyResult {

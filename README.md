@@ -1,19 +1,10 @@
 # v[apor]TPM
 
+**Cloud vTPM attestation library for Rust. Zero C dependencies.**
+
 > What does the "v" in vTPM stand for?
 
-Cloud vTPM attestation library for Rust. Zero C dependencies.
-
-## The Name
-
-```
-vTPM      →  v[apor]TPM
-lockboot  →  [g]lockboot
-```
-
-Physical TPM trust is vapor. It evaporates under scrutiny - supply chain attacks, firmware vulnerabilities, the whole theater. The only meaningful TPM trust lives in cloud vTPMs, where the hypervisor **is** the root of trust.
-
-The "v" always stood for vapor. Everyone just forgot.
+Physical TPM trust is vapor. It evaporates under scrutiny - supply chain attacks, firmware vulnerabilities, the whole theater. The only meaningful TPM trust lives in cloud vTPMs, where the hypervisor **is** the root of trust. The "v" always stood for vapor. Everyone just forgot.
 
 ## Crates
 
@@ -36,9 +27,11 @@ You handle **policy decisions**:
 
 | Platform | Status | Trust Anchor |
 |----------|--------|--------------|
-| AWS Nitro | ✅ Working | Nitro Root CA |
-| GCP Shielded VM | 🔜 Planned | Google AK certificate |
+| AWS EC2 with Nitro v4+ | ✅ Working | Nitro Root CA |
+| GCP Confidential VM | ✅ Working | Google EK/AK CA Root |
 | Azure Trusted Launch | 🔜 Planned | Microsoft AK certificate |
+
+Please note that GCP 'Shielded VM' with vTPM isn't enough, a 'Confidential VM' is necessary as Google doesn't provision AK certificates without that feature enabled (be it Intel TDX or AMD SEV)
 
 ## Quick Start
 
@@ -54,15 +47,12 @@ let json = attest(b"challenge-nonce")?;
 ### Verify Attestation (anywhere)
 
 ```rust
-use vaportpm_verify::{verify_attestation_json, VerificationResult};
+use vaportpm_verify::verify_attestation_json;
 
 let result = verify_attestation_json(&json)?;
-
-// Check the trust root is acceptable
-if result.root_pubkey_hash == KNOWN_AWS_NITRO_ROOT_HASH {
-    println!("Verified via: {:?}", result.method);
-    println!("Nonce: {}", result.nonce);
-}
+// Verification succeeded - attestation is from a supported cloud provider
+println!("Provider: {:?}", result.provider);
+println!("PCRs: {:?}", result.pcrs);
 ```
 
 ## License

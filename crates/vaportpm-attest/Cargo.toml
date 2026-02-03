@@ -18,6 +18,14 @@ serde_bytes = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
 
+# X.509 certificate parsing
+der = { workspace = true }
+x509-cert = { workspace = true }
+
 [lib]
 name = "vaportpm_attest"
 path = "src/lib.rs"
+
+[[bin]]
+name = "vaportpm-attest"
+path = "src/bin/attest.rs"

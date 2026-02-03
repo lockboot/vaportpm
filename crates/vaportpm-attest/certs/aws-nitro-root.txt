@@ -1,0 +1,39 @@
+Certificate:
+    Data:
+        Version: 3 (0x2)
+        Serial Number:
+            f9:31:75:68:1b:90:af:e1:1d:46:cc:b4:e4:e7:f8:56
+        Signature Algorithm: ecdsa-with-SHA384
+        Issuer: C=US, O=Amazon, OU=AWS, CN=aws.nitro-enclaves
+        Validity
+            Not Before: Oct 28 13:28:05 2019 GMT
+            Not After : Oct 28 14:28:05 2049 GMT
+        Subject: C=US, O=Amazon, OU=AWS, CN=aws.nitro-enclaves
+        Subject Public Key Info:
+            Public Key Algorithm: id-ecPublicKey
+                Public-Key: (384 bit)
+                pub:
+                    04:fc:02:54:eb:a6:08:c1:f3:68:70:e2:9a:da:90:
+                    be:46:38:32:92:73:6e:89:4b:ff:f6:72:d9:89:44:
+                    4b:50:51:e5:34:a4:b1:f6:db:e3:c0:bc:58:1a:32:
+                    b7:b1:76:07:0e:de:12:d6:9a:3f:ea:21:1b:66:e7:
+                    52:cf:7d:d1:dd:09:5f:6f:13:70:f4:17:08:43:d9:
+                    dc:10:01:21:e4:cf:63:01:28:09:66:44:87:c9:79:
+                    62:84:30:4d:c5:3f:f4
+                ASN1 OID: secp384r1
+                NIST CURVE: P-384
+        X509v3 extensions:
+            X509v3 Basic Constraints: critical
+                CA:TRUE
+            X509v3 Subject Key Identifier: 
+                90:25:B5:0D:D9:05:47:E7:96:C3:96:FA:72:9D:CF:99:A9:DF:4B:96
+            X509v3 Key Usage: critical
+                Digital Signature, Certificate Sign, CRL Sign
+    Signature Algorithm: ecdsa-with-SHA384
+    Signature Value:
+        30:66:02:31:00:a3:7f:2f:91:a1:c9:bd:5e:e7:b8:62:7c:16:
+        98:d2:55:03:8e:1f:03:43:f9:5b:63:a9:62:8c:3d:39:80:95:
+        45:a1:1e:bc:bf:2e:3b:55:d8:ae:ee:71:b4:c3:d6:ad:f3:02:
+        31:00:a2:f3:9b:16:05:b2:70:28:a5:dd:4b:a0:69:b5:01:6e:
+        65:b4:fb:de:8f:e0:06:1d:6a:53:19:7f:9c:da:f5:d9:43:bc:
+        61:fc:2b:eb:03:cb:6f:ee:8d:23:02:f3:df:f6
