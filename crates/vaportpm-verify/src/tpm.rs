@@ -2,35 +2,11 @@
 
 //! TPM attestation parsing and verification
 
-use std::collections::BTreeMap;
-
 use ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use pki_types::UnixTime;
-
 use crate::error::VerifyError;
-use crate::x509::{extract_public_key, parse_and_validate_cert_chain, parse_cert_chain_pem};
-
-// Import from vaportpm_attest (single source of truth)
-use vaportpm_attest::{PcrOps, Tpm, TpmAlg};
-
-/// Result of successful TPM attestation verification
-///
-/// This struct is only returned when verification succeeds.
-/// Verification checks:
-/// 1. EK public key from attestation matches EK certificate's public key
-/// 2. AK signature over nonce is valid
-/// 3. Certificate chain validates to root CA
-#[derive(Debug, Serialize)]
-pub struct TpmVerifyResult {
-    /// The nonce that was signed (hex-encoded)
-    pub nonce: String,
-    /// SHA-256 hash of the root CA's public key (hex string)
-    pub root_pubkey_hash: String,
-}
 
 /// Verify ECDSA-SHA256 signature over a message
 pub fn verify_ecdsa_p256(
@@ -54,254 +30,44 @@ pub fn verify_ecdsa_p256(
         .map_err(|e| VerifyError::SignatureInvalid(format!("Signature verification failed: {}", e)))
 }
 
-/// Verify TPM attestation
-///
-/// This verification approach works with TCG standard EKs (decrypt-only, cannot sign).
-/// It verifies:
-/// 1. The EK certificate chain validates to a root CA
-/// 2. The EK public key from the attestation output matches the certificate's EK public key
-/// 3. The AK's signature over the nonce is valid
-///
-/// # Arguments
-/// * `nonce_hex` - The nonce/attest_data as hex string
-/// * `signature_hex` - DER-encoded ECDSA signature as hex string (from AK)
-/// * `ak_pubkey_x_hex` - AK public key X coordinate (hex)
-/// * `ak_pubkey_y_hex` - AK public key Y coordinate (hex)
-/// * `ek_pubkey_x_hex` - EK public key X coordinate from attestation output (hex)
-/// * `ek_pubkey_y_hex` - EK public key Y coordinate from attestation output (hex)
-/// * `ek_certs_pem` - EK certificate chain in PEM format
-///
-/// # Returns
-/// Verification result with nonce and root public key hash.
-/// Returns an error if signature, chain validation, or EK pubkey matching fails.
-pub fn verify_tpm_attestation(
-    nonce_hex: &str,
-    signature_hex: &str,
-    ak_pubkey_x_hex: &str,
-    ak_pubkey_y_hex: &str,
-    ek_pubkey_x_hex: &str,
-    ek_pubkey_y_hex: &str,
-    ek_certs_pem: &str,
-) -> Result<TpmVerifyResult, VerifyError> {
-    // Decode hex inputs
-    let nonce = hex::decode(nonce_hex)?;
-    let signature = hex::decode(signature_hex)?;
-    let ak_x = hex::decode(ak_pubkey_x_hex)?;
-    let ak_y = hex::decode(ak_pubkey_y_hex)?;
-    let ek_x = hex::decode(ek_pubkey_x_hex)?;
-    let ek_y = hex::decode(ek_pubkey_y_hex)?;
-
-    // Construct AK public key in SEC1 uncompressed format: 0x04 || X || Y
-    let mut ak_pubkey = vec![0x04];
-    ak_pubkey.extend(&ak_x);
-    ak_pubkey.extend(&ak_y);
-
-    // Construct EK public key in SEC1 uncompressed format: 0x04 || X || Y
-    let mut ek_pubkey = vec![0x04];
-    ek_pubkey.extend(&ek_x);
-    ek_pubkey.extend(&ek_y);
-
-    // Parse the certificate chain to extract leaf cert's public key
-    let chain = parse_cert_chain_pem(ek_certs_pem)?;
-
-    // Extract EK public key from the leaf certificate
-    let cert_ek_pubkey = extract_public_key(&chain[0])?;
-
-    // Compare EK public key from attestation output with certificate's EK public key
-    if ek_pubkey != cert_ek_pubkey {
-        return Err(VerifyError::SignatureInvalid(
-            "EK public key from attestation does not match certificate's EK public key".into(),
-        ));
-    }
-
-    // Verify the AK's signature over the nonce
-    // Note: The AK signs SHA-256(nonce), not the raw nonce
-    verify_ecdsa_p256(&nonce, &signature, &ak_pubkey)?;
-
-    // Validate the certificate chain and get root's public key hash
-    // This uses webpki for signature and date validation
-    let chain_result = parse_and_validate_cert_chain(ek_certs_pem, UnixTime::now())?;
-    let root_pubkey_hash = chain_result.root_pubkey_hash;
-
-    Ok(TpmVerifyResult {
-        nonce: nonce_hex.to_string(),
-        root_pubkey_hash,
-    })
-}
-
-/// Verify TPM signature only (without EK certificate chain validation)
-///
-/// This is used in the Nitro path where trust comes from the Nitro attestation
-/// binding the TPM signing key. No EK certificate validation is needed.
-///
-/// # Arguments
-/// * `nonce_hex` - The nonce/attest_data as hex string
-/// * `signature_hex` - DER-encoded ECDSA signature as hex string (from AK)
-/// * `ak_pubkey_x_hex` - AK public key X coordinate (hex)
-/// * `ak_pubkey_y_hex` - AK public key Y coordinate (hex)
-///
-/// # Returns
-/// The verified nonce (hex-encoded) if signature is valid.
-pub fn verify_tpm_signature_only(
-    nonce_hex: &str,
-    signature_hex: &str,
-    ak_pubkey_x_hex: &str,
-    ak_pubkey_y_hex: &str,
-) -> Result<String, VerifyError> {
-    // Decode hex inputs
-    let nonce = hex::decode(nonce_hex)?;
-    let signature = hex::decode(signature_hex)?;
-    let ak_x = hex::decode(ak_pubkey_x_hex)?;
-    let ak_y = hex::decode(ak_pubkey_y_hex)?;
-
-    // Construct AK public key in SEC1 uncompressed format: 0x04 || X || Y
-    let mut ak_pubkey = vec![0x04];
-    ak_pubkey.extend(&ak_x);
-    ak_pubkey.extend(&ak_y);
-
-    // Verify the AK's signature over the nonce
-    verify_ecdsa_p256(&nonce, &signature, &ak_pubkey)?;
-
-    Ok(nonce_hex.to_string())
-}
-
-/// Calculate the expected PCR policy digest from PCR values
-///
-/// This calculates the TPM2 PolicyPCR digest that would be used as an
-/// authPolicy for a key bound to the given PCR values.
-///
-/// Uses the same implementation as vaportpm_attest to ensure consistency.
-///
-/// # Arguments
-/// * `pcrs` - Map of PCR index to hex-encoded PCR value
-/// * `pcr_alg` - The hash algorithm of the PCR bank (determines expected PCR size)
-///
-/// # Returns
-/// The expected policy digest as a hex-encoded string
-///
-/// # Example
-/// ```ignore
-/// let mut pcrs = BTreeMap::new();
-/// pcrs.insert(0, "0000...".to_string());  // 64 hex chars for SHA-256
-/// pcrs.insert(1, "0000...".to_string());
-/// let policy = calculate_pcr_policy(&pcrs, TpmAlg::Sha256)?;
-/// ```
-pub fn calculate_pcr_policy(
-    pcrs: &BTreeMap<u8, String>,
-    pcr_alg: TpmAlg,
-) -> Result<String, VerifyError> {
-    if pcrs.is_empty() {
-        return Err(VerifyError::InvalidAttest("No PCR values provided".into()));
-    }
-
-    // Determine expected PCR size based on algorithm
-    let expected_size = match pcr_alg {
-        TpmAlg::Sha256 => 32,
-        TpmAlg::Sha384 => 48,
-        _ => {
-            return Err(VerifyError::InvalidAttest(format!(
-                "Unsupported PCR algorithm: {:?}",
-                pcr_alg
-            )))
-        }
-    };
-
-    // Validate and convert PCR values from hex strings to bytes
-    // PCRs must be in sorted order (BTreeMap guarantees this)
-    let mut pcr_values: Vec<(u8, Vec<u8>)> = Vec::with_capacity(pcrs.len());
-    for (&idx, value_hex) in pcrs.iter() {
-        if idx > 23 {
-            return Err(VerifyError::InvalidAttest(format!(
-                "PCR index {} out of range (max 23)",
-                idx
-            )));
-        }
-        let value_bytes = hex::decode(value_hex)?;
-        if value_bytes.len() != expected_size {
-            return Err(VerifyError::InvalidAttest(format!(
-                "PCR {} has invalid length for {:?}: expected {} bytes, got {}",
-                idx,
-                pcr_alg,
-                expected_size,
-                value_bytes.len()
-            )));
-        }
-        pcr_values.push((idx, value_bytes));
-    }
-
-    // Use vaportpm_attest's implementation (single source of truth)
-    let policy_digest = Tpm::calculate_pcr_policy_digest(&pcr_values, pcr_alg)
-        .map_err(|e| VerifyError::InvalidAttest(format!("PCR policy calculation failed: {}", e)))?;
-
-    Ok(hex::encode(policy_digest))
-}
-
-/// Verify that a policy digest matches the expected PCR values
-///
-/// This is useful for verifying that an AK's authPolicy (if known) matches
-/// the PCR values reported in an attestation.
-///
-/// # Arguments
-/// * `expected_policy_hex` - The expected policy digest (hex string)
-/// * `pcrs` - The PCR values to verify against
-/// * `pcr_alg` - The hash algorithm of the PCR bank
-///
-/// # Returns
-/// Ok(()) if the policy matches, error otherwise
-pub fn verify_pcr_policy(
-    expected_policy_hex: &str,
-    pcrs: &BTreeMap<u8, String>,
-    pcr_alg: TpmAlg,
-) -> Result<(), VerifyError> {
-    let calculated_policy = calculate_pcr_policy(pcrs, pcr_alg)?;
-
-    if calculated_policy != expected_policy_hex {
-        return Err(VerifyError::InvalidAttest(format!(
-            "PCR policy mismatch: expected {}, calculated {}",
-            expected_policy_hex, calculated_policy
-        )));
-    }
-
-    Ok(())
-}
-
 // =============================================================================
-// TPM2B_ATTEST parsing and NIZK verification
+// TPM2B_ATTEST parsing (Quote only - Certify removed)
 // =============================================================================
 
 /// TPM_GENERATED magic value (0xff544347 = "ÿTCG")
 const TPM_GENERATED_VALUE: u32 = 0xff544347;
 
-/// TPM_ST_ATTEST_CERTIFY structure type
-const TPM_ST_ATTEST_CERTIFY: u16 = 0x8017;
+/// TPM_ST_ATTEST_QUOTE structure type
+const TPM_ST_ATTEST_QUOTE: u16 = 0x8018;
 
 /// Size of TPMS_CLOCK_INFO structure: clock(8) + resetCount(4) + restartCount(4) + safe(1)
 const TPMS_CLOCK_INFO_SIZE: usize = 17;
 
-/// Parsed TPMS_ATTEST structure (from TPM2_Certify)
+/// Parsed TPMS_ATTEST structure (from TPM2_Quote)
 #[derive(Debug)]
-pub struct TpmAttestInfo {
+pub struct TpmQuoteInfo {
     /// Nonce/qualifying data from extraData field (raw bytes)
     pub nonce: Vec<u8>,
-    /// Name of the certified object (nameAlg || H(public_area))
-    pub certified_name: Vec<u8>,
     /// Name of the signing key
     pub signer_name: Vec<u8>,
+    /// PCR selection (algorithm, PCR indices as bitmap)
+    pub pcr_select: Vec<(u16, Vec<u8>)>,
+    /// Digest of the selected PCRs (hash of concatenated PCR values)
+    pub pcr_digest: Vec<u8>,
 }
 
-/// Parse TPM2B_ATTEST structure (CERTIFY type)
+/// Parse TPM2B_ATTEST structure (QUOTE type)
 ///
 /// TPM2B_ATTEST contains a TPMS_ATTEST structure which includes:
 /// - magic: 0xff544347 (TPM_GENERATED_VALUE)
-/// - type: 0x8017 (TPM_ST_ATTEST_CERTIFY)
+/// - type: 0x8018 (TPM_ST_ATTEST_QUOTE)
 /// - qualifiedSigner: TPM2B_NAME
 /// - extraData: TPM2B_DATA (our nonce)
 /// - clockInfo: TPMS_CLOCK_INFO
 /// - firmwareVersion: u64
-/// - attested.certify.name: TPM2B_NAME (certified object's name)
-/// - attested.certify.qualifiedName: TPM2B_NAME
-pub fn parse_tpm2b_attest(data: &[u8]) -> Result<TpmAttestInfo, VerifyError> {
-    // Use a cursor to track position with overflow-safe arithmetic
+/// - attested.quote.pcrSelect: TPML_PCR_SELECTION (PCRs that were quoted)
+/// - attested.quote.pcrDigest: TPM2B_DIGEST (hash of PCR values)
+pub fn parse_quote_attest(data: &[u8]) -> Result<TpmQuoteInfo, VerifyError> {
     let mut cursor = SafeCursor::new(data);
 
     // magic (4 bytes)
@@ -317,10 +83,10 @@ pub fn parse_tpm2b_attest(data: &[u8]) -> Result<TpmAttestInfo, VerifyError> {
     // type (2 bytes)
     let type_bytes = cursor.read_bytes(2, "type")?;
     let attest_type = u16::from_be_bytes(type_bytes.try_into().unwrap());
-    if attest_type != TPM_ST_ATTEST_CERTIFY {
+    if attest_type != TPM_ST_ATTEST_QUOTE {
         return Err(VerifyError::InvalidAttest(format!(
-            "Invalid attest type: expected 0x{:04x} (CERTIFY), got 0x{:04x}",
-            TPM_ST_ATTEST_CERTIFY, attest_type
+            "Invalid attest type: expected 0x{:04x} (QUOTE), got 0x{:04x}",
+            TPM_ST_ATTEST_QUOTE, attest_type
         )));
     }
 
@@ -336,14 +102,18 @@ pub fn parse_tpm2b_attest(data: &[u8]) -> Result<TpmAttestInfo, VerifyError> {
     // firmwareVersion (8 bytes) - skip it
     cursor.skip(8, "firmwareVersion")?;
 
-    // attested (TPMS_CERTIFY_INFO)
-    // - name (TPM2B_NAME)
-    let certified_name = cursor.read_tpm2b("certifiedName")?;
+    // attested (TPMS_QUOTE_INFO)
+    // - pcrSelect (TPML_PCR_SELECTION)
+    let pcr_select = cursor.read_pcr_selection("pcrSelect")?;
 
-    Ok(TpmAttestInfo {
+    // - pcrDigest (TPM2B_DIGEST)
+    let pcr_digest = cursor.read_tpm2b("pcrDigest")?;
+
+    Ok(TpmQuoteInfo {
         nonce,
-        certified_name,
         signer_name,
+        pcr_select,
+        pcr_digest,
     })
 }
 
@@ -390,6 +160,67 @@ impl<'a> SafeCursor<'a> {
         let data = self.read_bytes(size, field)?;
         Ok(data.to_vec())
     }
+
+    /// Read a u16 value (big-endian)
+    fn read_u16(&mut self, field: &str) -> Result<u16, VerifyError> {
+        let bytes = self.read_bytes(2, field)?;
+        Ok(u16::from_be_bytes(bytes.try_into().unwrap()))
+    }
+
+    /// Read a u32 value (big-endian)
+    fn read_u32(&mut self, field: &str) -> Result<u32, VerifyError> {
+        let bytes = self.read_bytes(4, field)?;
+        Ok(u32::from_be_bytes(bytes.try_into().unwrap()))
+    }
+
+    /// Read a u8 value
+    fn read_u8(&mut self, field: &str) -> Result<u8, VerifyError> {
+        let bytes = self.read_bytes(1, field)?;
+        Ok(bytes[0])
+    }
+
+    /// Read TPML_PCR_SELECTION structure
+    ///
+    /// Returns a list of (algorithm, PCR bitmap) pairs
+    fn read_pcr_selection(&mut self, field: &str) -> Result<Vec<(u16, Vec<u8>)>, VerifyError> {
+        let count = self.read_u32(&format!("{}.count", field))?;
+
+        // Sanity check: count should be reasonable (max ~16 different algorithms)
+        if count > 16 {
+            return Err(VerifyError::InvalidAttest(format!(
+                "{}: count {} exceeds reasonable maximum",
+                field, count
+            )));
+        }
+
+        let mut selections = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            // TPMS_PCR_SELECTION:
+            // - hash (2 bytes) - algorithm
+            let hash_alg = self.read_u16(&format!("{}.selection[{}].hash", field, i))?;
+
+            // - sizeofSelect (1 byte) - bitmap size (typically 3 for 24 PCRs)
+            let bitmap_size = self.read_u8(&format!("{}.selection[{}].sizeofSelect", field, i))?;
+
+            // Sanity check: bitmap size should be reasonable (max 32 for 256 PCRs)
+            if bitmap_size > 32 {
+                return Err(VerifyError::InvalidAttest(format!(
+                    "{}.selection[{}].sizeofSelect {} exceeds maximum",
+                    field, i, bitmap_size
+                )));
+            }
+
+            // - pcrSelect (variable) - bitmap
+            let bitmap = self.read_bytes(
+                bitmap_size as usize,
+                &format!("{}.selection[{}].pcrSelect", field, i),
+            )?;
+
+            selections.push((hash_alg, bitmap.to_vec()));
+        }
+
+        Ok(selections)
+    }
 }
 
 #[cfg(test)]
@@ -398,7 +229,6 @@ mod tests {
     use ecdsa::signature::hazmat::PrehashSigner;
     use p256::ecdsa::SigningKey;
     use sha2::Sha256;
-    use vaportpm_attest::TpmAlg;
 
     /// Generate a test P-256 key pair and sign a message
     /// The signature is over SHA256(message) to match what verify_ecdsa_p256 expects
@@ -595,248 +425,5 @@ mod tests {
 
         let result = verify_ecdsa_p256(&message, &signature, &pubkey);
         assert!(result.is_ok());
-    }
-
-    // === PCR Policy Calculation Tests ===
-
-    #[test]
-    fn test_calculate_pcr_policy_single_pcr() {
-        // Test with a single PCR (all zeros)
-        let mut pcrs = BTreeMap::new();
-        let pcr0 = "0".repeat(64); // 32 bytes of zeros as hex
-        pcrs.insert(0, pcr0);
-
-        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
-        assert!(result.is_ok());
-
-        let policy = result.unwrap();
-        // Policy should be a 64-character hex string (32 bytes)
-        assert_eq!(policy.len(), 64);
-    }
-
-    #[test]
-    fn test_calculate_pcr_policy_multiple_pcrs() {
-        // Test with PCRs 0, 1, 2
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(0, "0".repeat(64));
-        pcrs.insert(1, "1".repeat(64)); // All 0x11...
-        pcrs.insert(2, "2".repeat(64)); // All 0x22...
-
-        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_calculate_pcr_policy_non_contiguous() {
-        // Test with non-contiguous PCRs (0, 7, 15)
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(0, "0".repeat(64));
-        pcrs.insert(7, "7".repeat(64));
-        pcrs.insert(15, "f".repeat(64));
-
-        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_calculate_pcr_policy_deterministic() {
-        // Same input should produce same output
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(0, "0".repeat(64));
-
-        let policy1 = calculate_pcr_policy(&pcrs, TpmAlg::Sha256).unwrap();
-        let policy2 = calculate_pcr_policy(&pcrs, TpmAlg::Sha256).unwrap();
-
-        assert_eq!(policy1, policy2);
-    }
-
-    #[test]
-    fn test_calculate_pcr_policy_different_values() {
-        // Different PCR values should produce different policies
-        let mut pcrs1 = BTreeMap::new();
-        pcrs1.insert(0, "0".repeat(64));
-
-        let mut pcrs2 = BTreeMap::new();
-        pcrs2.insert(0, "1".repeat(64));
-
-        let policy1 = calculate_pcr_policy(&pcrs1, TpmAlg::Sha256).unwrap();
-        let policy2 = calculate_pcr_policy(&pcrs2, TpmAlg::Sha256).unwrap();
-
-        assert_ne!(policy1, policy2);
-    }
-
-    #[test]
-    fn test_calculate_pcr_policy_empty() {
-        let pcrs: BTreeMap<u8, String> = BTreeMap::new();
-        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
-        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
-    }
-
-    #[test]
-    fn test_calculate_pcr_policy_invalid_index() {
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(24, "0".repeat(64)); // Index 24 is invalid (max 23)
-
-        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
-        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
-    }
-
-    #[test]
-    fn test_calculate_pcr_policy_invalid_length() {
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(0, "0".repeat(32)); // Only 16 bytes, need 32
-
-        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
-        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
-    }
-
-    #[test]
-    fn test_calculate_pcr_policy_invalid_hex() {
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(0, "gg".repeat(32)); // Invalid hex
-
-        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha256);
-        assert!(matches!(result, Err(VerifyError::HexDecode(_))));
-    }
-
-    #[test]
-    fn test_verify_pcr_policy_match() {
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(0, "0".repeat(64));
-
-        let expected = calculate_pcr_policy(&pcrs, TpmAlg::Sha256).unwrap();
-        let result = verify_pcr_policy(&expected, &pcrs, TpmAlg::Sha256);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_verify_pcr_policy_mismatch() {
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(0, "0".repeat(64));
-
-        // Wrong expected policy
-        let wrong_expected = "f".repeat(64);
-        let result = verify_pcr_policy(&wrong_expected, &pcrs, TpmAlg::Sha256);
-        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
-    }
-
-    // === SHA-384 PCR Policy Tests ===
-
-    #[test]
-    fn test_calculate_pcr_policy_sha384() {
-        // Test with SHA-384 PCRs (48 bytes = 96 hex chars)
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(0, "0".repeat(96));
-
-        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha384);
-        assert!(result.is_ok());
-
-        let policy = result.unwrap();
-        // Policy is always SHA-256 (32 bytes = 64 hex chars)
-        assert_eq!(policy.len(), 64);
-    }
-
-    #[test]
-    fn test_calculate_pcr_policy_sha384_wrong_size() {
-        // SHA-384 expects 48 bytes, not 32
-        let mut pcrs = BTreeMap::new();
-        pcrs.insert(0, "0".repeat(64)); // 32 bytes - wrong for SHA-384
-
-        let result = calculate_pcr_policy(&pcrs, TpmAlg::Sha384);
-        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
-    }
-
-    #[test]
-    fn test_calculate_pcr_policy_different_alg_different_policy() {
-        // Same PCR value but different algorithms should produce different policies
-        // because the algorithm ID is encoded in the PCR selection structure
-        let mut pcrs256 = BTreeMap::new();
-        pcrs256.insert(0, "0".repeat(64)); // 32 bytes for SHA-256
-
-        let mut pcrs384 = BTreeMap::new();
-        pcrs384.insert(0, "0".repeat(96)); // 48 bytes for SHA-384 (different zeros count)
-
-        let policy256 = calculate_pcr_policy(&pcrs256, TpmAlg::Sha256).unwrap();
-        let policy384 = calculate_pcr_policy(&pcrs384, TpmAlg::Sha384).unwrap();
-
-        // Policies should differ due to algorithm ID in selection structure
-        assert_ne!(policy256, policy384);
-    }
-
-    // === Malicious Input Tests for parse_tpm2b_attest ===
-
-    #[test]
-    fn test_attest_empty_input() {
-        let result = parse_tpm2b_attest(&[]);
-        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
-    }
-
-    #[test]
-    fn test_attest_truncated_magic() {
-        // Only 2 bytes when magic needs 4
-        let result = parse_tpm2b_attest(&[0xff, 0x54]);
-        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
-    }
-
-    #[test]
-    fn test_attest_wrong_magic() {
-        // Valid length but wrong magic value
-        let mut data = vec![0x00, 0x00, 0x00, 0x00]; // Wrong magic
-        data.extend(&[0x80, 0x17]); // Correct type
-        let result = parse_tpm2b_attest(&data);
-        assert!(matches!(result, Err(VerifyError::InvalidAttest(_))));
-    }
-
-    #[test]
-    fn test_attest_huge_signer_size() {
-        // Craft input with valid magic/type but huge signer size
-        let mut data = vec![];
-        data.extend(&0xff544347u32.to_be_bytes()); // magic
-        data.extend(&0x8017u16.to_be_bytes()); // type
-        data.extend(&0xffffu16.to_be_bytes()); // signer size = 65535 (way too big)
-
-        let result = parse_tpm2b_attest(&data);
-        assert!(
-            matches!(result, Err(VerifyError::InvalidAttest(_))),
-            "Should reject huge signer size, got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_attest_huge_extra_size() {
-        // Craft input with valid magic/type, small signer, but huge extra size
-        let mut data = vec![];
-        data.extend(&0xff544347u32.to_be_bytes()); // magic
-        data.extend(&0x8017u16.to_be_bytes()); // type
-        data.extend(&0x0000u16.to_be_bytes()); // signer size = 0
-        data.extend(&0xffffu16.to_be_bytes()); // extra size = 65535 (way too big)
-
-        let result = parse_tpm2b_attest(&data);
-        assert!(
-            matches!(result, Err(VerifyError::InvalidAttest(_))),
-            "Should reject huge extra size, got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_attest_truncated_after_sizes() {
-        // Valid header but truncated before clockInfo
-        let mut data = vec![];
-        data.extend(&0xff544347u32.to_be_bytes()); // magic
-        data.extend(&0x8017u16.to_be_bytes()); // type
-        data.extend(&0x0002u16.to_be_bytes()); // signer size = 2
-        data.extend(&[0x00, 0x0b]); // signer (2 bytes)
-        data.extend(&0x0004u16.to_be_bytes()); // extra size = 4
-        data.extend(&[0x01, 0x02, 0x03, 0x04]); // extra (4 bytes)
-                                                // Missing: clockInfo, firmwareVersion, certifiedName
-
-        let result = parse_tpm2b_attest(&data);
-        assert!(
-            matches!(result, Err(VerifyError::InvalidAttest(_))),
-            "Should reject truncated input, got: {:?}",
-            result
-        );
     }
 }

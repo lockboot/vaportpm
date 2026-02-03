@@ -1,10 +1,10 @@
 # vaportpm-verify
 
-Verification library for TPM and Nitro attestations produced by `vaportpm-attest`.
+Verification library for attestations produced by `vaportpm-attest`.
 
 ## Overview
 
-This crate verifies attestation documents without requiring TPM access. It can run anywhere - on a server, in a browser (via WASM), or in any environment that needs to verify attestations.
+This crate verifies attestation documents without requiring TPM or internet access. It can run anywhere - on a server, in a browser (via WASM), or in any environment that needs to verify attestations.
 
 ## Features
 
@@ -26,7 +26,7 @@ fn verify(json: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Verify the entire attestation with current time
     let result = verify_attestation_output(&output, UnixTime::now())?;
 
-    println!("Verified via: {:?}", result.method);
+    println!("Verified via: {:?}", result.provider);
     println!("Nonce: {}", result.nonce);
     println!("Root CA hash: {}", result.root_pubkey_hash);
 
@@ -43,10 +43,18 @@ fn verify(json: &str) -> Result<(), Box<dyn std::error::Error>> {
 | COSE Signature | ECDSA P-384 signature over Nitro document |
 | Certificate Chain | Validates chain, returns root pubkey hash |
 | Public Key Binding | AK public key matches signed `public_key` field |
-| TPM Signature | AK's ECDSA P-256 signature over TPM2B_ATTEST |
-| PCR Policy | Certified name matches computed policy from SHA-384 PCRs |
-| Nonce Binding | TPM nonce matches Nitro nonce (freshness) |
+| TPM Quote Signature | AK's ECDSA P-256 signature over TPM2_Quote |
+| Nonce Binding | TPM Quote nonce matches Nitro nonce (freshness) |
 | PCR Values | Claimed PCRs match signed values in Nitro document |
+
+### GCP Path (Google Cloud)
+
+| Check | Description |
+|-------|-------------|
+| AK Certificate Chain | Validates chain to Google CA, returns root pubkey hash |
+| TPM Quote Signature | AK's ECDSA P-256 signature over TPM2_Quote |
+| Nonce Verification | Quote extraData matches expected nonce |
+| PCR Digest | Quote's pcrDigest matches hash of claimed PCRs |
 
 ### Verification Result
 
@@ -54,14 +62,16 @@ fn verify(json: &str) -> Result<(), Box<dyn std::error::Error>> {
 pub struct VerificationResult {
     /// The verified nonce (hex-encoded)
     pub nonce: String,
+    /// Cloud provider (AWS, GCP)
+    pub provider: CloudProvider,
+    /// PCR values from the attestation
+    pub pcrs: BTreeMap<u8, String>,
     /// SHA-256 hash of the root CA's public key
     pub root_pubkey_hash: String,
-    /// How verification was performed
-    pub method: VerificationMethod,
 }
 ```
 
-The `root_pubkey_hash` identifies the trust anchor. For AWS Nitro, this is the hash of the Nitro Root CA's public key.
+The `root_pubkey_hash` identifies the trust anchor. For AWS Nitro, this is the hash of the Nitro Root CA's public key. For GCP, this is the hash of Google's AK Root CA.
 
 ## API
 
@@ -85,13 +95,9 @@ Returns `VerificationResult` containing:
 
 ## Security Considerations
 
-### Trust Model
+The library embeds the hashes of known Amazon & Google certificate authorities and verification will fail if it encounters an unknown root of trust, the full certificate chain must be provided in the attestation.
 
-This library is **trust-agnostic**. It verifies cryptographic signatures and returns the `root_pubkey_hash` - the SHA-256 hash of the root CA's public key. **You** decide whether to trust that root.
-
-For AWS Nitro, you would check that `root_pubkey_hash` matches the known AWS Nitro Root CA public key hash.
-
-### What You Must Verify Separately
+However, beyond that it's up to the application to decide on the following:
 
 1. **PCR Semantics** - This library verifies PCR *values*, not their *meaning*. You need to know what software produces which measurements.
 
@@ -99,27 +105,3 @@ For AWS Nitro, you would check that `root_pubkey_hash` matches the known AWS Nit
 
 3. **Application Logic** - The attestation proves system state at a point in time. Your application must decide if that state is acceptable.
 
-### Verification Flow
-
-```mermaid
-flowchart TD
-    A[AttestationOutput JSON] --> B{Nitro Present?}
-    B -->|Yes| C[Verify Nitro Document]
-    B -->|No| X[Error: Unsupported]
-
-    C --> D[Verify COSE Signature]
-    D --> E[Validate Cert Chain]
-    E --> F[Extract signed public_key]
-
-    F --> G[Verify TPM Signature]
-    G --> H[Parse TPM2B_ATTEST]
-    H --> I[Compute PCR Policy]
-    I --> J{Name Match?}
-
-    J -->|Yes| K[Verify Nonce Binding]
-    J -->|No| Y[Error: PCR Mismatch]
-
-    K --> L{Nonces Match?}
-    L -->|Yes| M[Success: Return VerificationResult]
-    L -->|No| Z[Error: Freshness Failed]
-```

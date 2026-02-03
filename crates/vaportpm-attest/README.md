@@ -1,62 +1,33 @@
 # vaportpm-attest
 
-Cloud vTPM attestation in pure Rust with **zero C dependencies**.
+Produces a self-contained attestation document from a cloud vTPM. The output can be verified offline using [`vaportpm-verify`](../vaportpm-verify/).
 
-> Physical TPM trust is vapor. Cloud vTPM is where the real trust lives.
+```rust
+use vaportpm_attest::attest;
+
+let output = attest(nonce, user_data)?;
+// output.to_json() -> send to verifier
+```
+
+The library auto-detects the cloud platform (AWS Nitro, GCP Confidential VM) and produces a JSON document containing:
+- TPM2_Quote (signed PCR values)
+- Platform-specific trust chain (Nitro document or GCP AK certificate)
+- PCR values and nonce for verification
 
 ---
 
-Most people wrap the crusty C-based `tss2` monolith. Instead, this library implements the bare minimum TPM 2.0 wire-protocol, yeeting bytes directly to `/dev/tpm0`:
+Implements the TPM 2.0 wire protocol in pure Rust—no `tss2` or C dependencies. While low-level TPM operations are exposed via extension traits, the primary interface is `attest()`.
 
-- No libtss2, or any C toolchain
-- Direct protocol command/response serialization
-- Minimal, and focused on cloud attestation
-- Comprehensive `selftest` binary
+## Low-Level TPM Operations
 
-## Features
+The following traits are available for direct TPM interaction:
 
-### PCR Operations (`PcrOps` trait)
-
-- Read PCR values from all active banks (SHA-1, SHA-256, SHA-384, SHA-512)
-- Extend PCRs with automatic multi-bank support
-- Query which banks a PCR is allocated in
-- Read all allocated PCRs from the TPM
-
-### Key Management
-
-- Create primary ECC P-256 signing keys
-- Sign data with TPM keys (ECDSA signatures)
-- Create PCR-sealed keys (policy-based authorization)
-
-### NV RAM Operations (`NvOps` trait)
-
-- **Read Operations:**
-  - Read from TPM Non-Volatile storage
-  - Read NV index public information
-  - Enumerate all NV indices
-  - Read Endorsement Key (EK) certificates
-- **Write Operations:**
-  - Define new NV spaces with attributes
-  - Write data to NV indices
-  - Undefine (delete) NV spaces
-  - Find free NV indices
-
-### Attestation
-
-- Certify keys using other keys
-- Generate attestation structures
-- PCR policy digest calculation
-
-### AWS Nitro Security Module (NSM) Support (`NsmOps` trait)
-
-- Request attestation documents from AWS Nitro Secure Module
-- Includes PCR values, optional user data, nonce, and public key
-- Automatic detection of Nitro TPM via vendor string
-
-### TPM Vendor Detection
-
-- Query TPM manufacturer and vendor information
-- Check if running on AWS Nitro TPM (`is_nitro_tpm()`)
+| Trait | Operations |
+|-------|------------|
+| `PcrOps` | Read/extend PCRs across all hash banks |
+| `NvOps` | Read/write NV RAM, enumerate indices |
+| `KeyOps` | Create signing keys, TPM2_Quote |
+| `NsmOps` | AWS Nitro Security Module attestation |
 
 ## Quick Start
 
@@ -151,40 +122,6 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
-## Running Tests
-
-### `selftest` - Comprehensive TPM Test Suite
-
-The "self test" binary exercises all major functionality:
-
-```bash
-cargo run --bin selftest
-```
-
-It performs:
-1. Query TPM properties (manufacturer, firmware version, etc.)
-2. Detect AWS Nitro TPM
-3. Query active PCR banks
-4. Read all non-zero PCR values
-5. Extend PCR 23 and verify the change
-6. Create a primary ECC signing key
-7. Sign test data
-8. Access the Endorsement Key
-9. Read EK certificates from NV RAM
-10. Enumerate all NV indices
-11. Create PCR-sealed keys
-12. Certify keys (attestation)
-
-### `nsmtest` - AWS Nitro Security Module Test
-
-Test NSM attestation functionality (requires AWS Nitro TPM):
-
-```bash
-cargo run --bin nsmtest
-```
-
-This requests an attestation document from the Nitro Secure Module and displays the result.
-
 ## Requirements
 
 - Linux with TPM 2.0 support
@@ -221,7 +158,7 @@ The library implements the TPM 2.0 command/response protocol as specified in the
 - `TPM2_NV_Write` - Write to NV storage
 - `TPM2_NV_UndefineSpace` - Delete NV indices
 - `TPM2_PolicyPCR` - PCR policy operations
-- `TPM2_Certify` - Key certification/attestation
+- `TPM2_Quote` - PCR attestation
 
 **Vendor-Specific Commands:**
 - `TPM2_CC_VENDOR_AWS_NSM_REQUEST` (0x20000001) - AWS Nitro Security Module attestation
@@ -233,11 +170,11 @@ The library uses extension traits to organize functionality:
 - **`PcrOps`** - PCR read/extend operations
 - **`NvOps`** - NV RAM read/write operations
 - **`NsmOps`** - AWS Nitro Security Module operations
-- **`EkOps`** - Endorsement Key operations (create standard EK, signing keys)
+- **`KeyOps`** - Key operations (create signing keys, TPM2_Quote)
 
 Import the traits you need:
 ```rust
-use vaportpm_attest::{Tpm, PcrOps, NvOps, NsmOps, EkOps};
+use vaportpm_attest::{Tpm, PcrOps, NvOps, NsmOps, KeyOps};
 ```
 
 ### Hash Algorithms
@@ -252,36 +189,11 @@ Supports multiple PCR banks:
 
 ### Attestation Model
 
-The library implements a TPM-based attestation model where:
+The library generates TPM2_Quote attestations signed by a long-lived Attestation Key (AK). The AK's authenticity is proven via platform-specific trust anchors:
 
-1. **Endorsement Key (EK)** - A TPM's identity, certified by the manufacturer. Created using the TCG standard template for deterministic key derivation. The EK is decrypt-only (cannot sign).
+- **AWS Nitro**: The AK public key is embedded in a Nitro attestation document (via `nsm_attest`), which is signed by Amazon's Nitro CA chain.
+- **GCP Shielded VM**: The AK has a certificate stored in TPM NV RAM, signed by Google's CA chain.
 
-2. **Attestation Key (AK)** - A signing key created with a PCR policy. The AK can only be used when PCRs match specific values, cryptographically binding the key to the system state.
-
-3. **PCR Policy** - A SHA-256 digest computed from PCR values. When an AK is created with an `authPolicy`, it can only sign when `TPM2_PolicyPCR` succeeds with matching values.
-
-4. **TPM2_Certify** - The AK self-certifies, producing a `TPM2B_ATTEST` structure containing the AK's name (which includes its `authPolicy`). This proves the AK exists and is bound to specific PCR values.
-
-### Chain of Trust
-
-```mermaid
-flowchart TD
-    A["<b>Trust Anchor</b><br/>Nitro Root CA / TPM Manufacturer / Cloud Provider"]
-    B["<b>Platform Attestation</b><br/>Nitro Document / EK Certificate / AK Certificate"]
-    C["<b>Signing Key (AK)</b><br/>Bound to PCR values via authPolicy"]
-    D["<b>TPM2B_ATTEST + Signature</b><br/>Contains: nonce, AK name (proves PCR binding)"]
-
-    A -->|signs| B
-    B -->|binds| C
-    C -->|signs| D
-```
-
-### Platform-Specific Trust
-
-| Platform | Trust Anchor | AK Binding Method |
-|----------|-------------|-------------------|
-| AWS Nitro | Nitro Root CA | Nitro document `public_key` field |
-| GCP Shielded VM | Google CA | AK certificate (NV 0x01c10000) |
-| Azure Trusted Launch | Microsoft CA | AK certificate (NV 0x01C101D0) |
+Both paths produce a TPM2_Quote (signed PCR values + nonce) that can be verified against the platform's root of trust.
 
 See [AWS-NITRO.md](./AWS-NITRO.md) for detailed AWS Nitro attestation documentation.

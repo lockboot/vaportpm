@@ -24,12 +24,11 @@ x509-cert = { version = "0.2", features = ["pem"] }
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 p384 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 ecdsa = { version = "0.16", features = ["verifying", "der"] }
+rsa = { version = "0.9", features = ["sha2"] }
 coset = "0.3"
 ciborium = "0.2"
 
-# Certificate chain validation (rustls ecosystem)
-rustls-rustcrypto = { version = "=0.0.2-alpha", default-features = false, features = ["std", "zeroize"] }
-webpki = { package = "rustls-webpki", version = "=0.102.8", default-features = false, features = ["alloc"] }
+# Time types for certificate validation
 pki-types = { package = "rustls-pki-types", version = "=1.13.0", default-features = false, features = ["std"] }
 
 [profile.release]

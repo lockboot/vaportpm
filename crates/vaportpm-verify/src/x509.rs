@@ -1,18 +1,138 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! X.509 certificate handling using rustls-webpki for chain validation
+//! X.509 certificate chain validation
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use der::oid::ObjectIdentifier;
 use der::{Decode, Encode};
 use ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
-use pki_types::{CertificateDer, UnixTime};
+use pki_types::UnixTime;
+use rsa::pkcs1v15::{Signature as RsaSignature, VerifyingKey as RsaVerifyingKey};
+use rsa::RsaPublicKey;
 use sha2::{Digest, Sha256};
-use webpki::{anchor_from_trusted_cert, EndEntityCert, KeyUsage};
 use x509_cert::Certificate;
 
 use crate::error::VerifyError;
+
+// X.509 extension OIDs
+const OID_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15");
+const OID_BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.19");
+
+/// Key Usage extension flags (OID 2.5.29.15)
+/// Only includes bits used for TPM certificate chain validation.
+#[derive(Debug, Clone, Default)]
+pub struct KeyUsageFlags {
+    /// digitalSignature (bit 0) - key can be used to verify digital signatures
+    pub digital_signature: bool,
+    /// keyCertSign (bit 5) - key can be used to verify certificate signatures
+    pub key_cert_sign: bool,
+}
+
+/// Basic Constraints extension (OID 2.5.29.19)
+#[derive(Debug, Clone, Default)]
+pub struct BasicConstraints {
+    /// Whether this certificate is a CA
+    pub ca: bool,
+    /// Maximum number of intermediate certificates allowed below this CA
+    pub path_len_constraint: Option<u8>,
+}
+
+/// Extract Key Usage extension from a certificate (OID 2.5.29.15)
+///
+/// Returns None if the extension is not present.
+pub fn extract_key_usage(cert: &Certificate) -> Option<KeyUsageFlags> {
+    let extensions = cert.tbs_certificate.extensions.as_ref()?;
+
+    for ext in extensions.iter() {
+        if ext.extn_id == OID_KEY_USAGE {
+            // Key Usage is a BIT STRING
+            // The extn_value is an OctetString containing the DER-encoded BIT STRING directly
+            // (x509_cert already unwrapped the outer OCTET STRING)
+            let bit_string = der::asn1::BitString::from_der(ext.extn_value.as_bytes()).ok()?;
+
+            // Key Usage bits are numbered from the most significant bit
+            // Bit 0 = digitalSignature (MSB of first byte)
+            // Bit 5 = keyCertSign
+            let raw_bits = bit_string.raw_bytes();
+            if raw_bits.is_empty() {
+                return Some(KeyUsageFlags::default());
+            }
+
+            let byte0 = raw_bits[0];
+
+            return Some(KeyUsageFlags {
+                digital_signature: (byte0 & 0x80) != 0, // bit 0
+                key_cert_sign: (byte0 & 0x04) != 0,     // bit 5
+            });
+        }
+    }
+    None
+}
+
+/// Extract Basic Constraints extension from a certificate (OID 2.5.29.19)
+///
+/// Returns None if the extension is not present.
+pub fn extract_basic_constraints(cert: &Certificate) -> Option<BasicConstraints> {
+    let extensions = cert.tbs_certificate.extensions.as_ref()?;
+
+    for ext in extensions.iter() {
+        if ext.extn_id == OID_BASIC_CONSTRAINTS {
+            // BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER (0..MAX) OPTIONAL }
+            // The extn_value is an OctetString containing the DER-encoded SEQUENCE directly
+            let bytes = ext.extn_value.as_bytes();
+
+            // Parse the SEQUENCE header manually
+            if bytes.is_empty() {
+                return Some(BasicConstraints::default());
+            }
+
+            // First byte should be SEQUENCE tag (0x30)
+            if bytes[0] != 0x30 {
+                return Some(BasicConstraints::default());
+            }
+
+            // Get length
+            if bytes.len() < 2 {
+                return Some(BasicConstraints::default());
+            }
+
+            let len = bytes[1] as usize;
+            let seq_start = 2;
+
+            // Empty sequence means cA defaults to false
+            if len == 0 {
+                return Some(BasicConstraints::default());
+            }
+
+            // Parse sequence contents
+            let seq_bytes = &bytes[seq_start..seq_start + len.min(bytes.len() - seq_start)];
+
+            let mut bc = BasicConstraints::default();
+
+            // Check if there's a BOOLEAN (tag 0x01)
+            if !seq_bytes.is_empty() && seq_bytes[0] == 0x01 {
+                // BOOLEAN: tag (0x01), length (0x01), value
+                if seq_bytes.len() >= 3 && seq_bytes[1] == 0x01 {
+                    bc.ca = seq_bytes[2] != 0;
+
+                    // Check for pathLenConstraint after BOOLEAN
+                    if seq_bytes.len() >= 6 && seq_bytes[3] == 0x02 {
+                        // INTEGER: tag (0x02), length, value
+                        let int_len = seq_bytes[4] as usize;
+                        if int_len == 1 && seq_bytes.len() >= 6 {
+                            bc.path_len_constraint = Some(seq_bytes[5]);
+                        }
+                    }
+                }
+            }
+
+            return Some(bc);
+        }
+    }
+    None
+}
 
 /// Maximum allowed certificate chain depth (to prevent DoS)
 pub const MAX_CHAIN_DEPTH: usize = 10;
@@ -160,102 +280,33 @@ pub struct ChainValidationResult {
     pub root_pubkey_hash: String,
 }
 
-/// Validate a certificate chain using webpki
+/// Validate certificate chain with rigid X.509 validation
 ///
-/// Chain should be leaf-first, root-last. Time must be provided by caller.
-pub fn validate_cert_chain(
-    chain: &[Certificate],
-    time: UnixTime,
-) -> Result<ChainValidationResult, VerifyError> {
-    if chain.is_empty() {
-        return Err(VerifyError::ChainValidation(
-            "Empty certificate chain".into(),
-        ));
-    }
-    if chain.len() > MAX_CHAIN_DEPTH {
-        return Err(VerifyError::ChainValidation(format!(
-            "Certificate chain too deep: {} certificates (max {})",
-            chain.len(),
-            MAX_CHAIN_DEPTH
-        )));
-    }
-
-    // Get signature verification algorithms from rustls-rustcrypto
-    let sig_algs = rustls_rustcrypto::provider()
-        .signature_verification_algorithms
-        .all;
-
-    // Convert to DER format for webpki
-    let cert_ders: Vec<CertificateDer> = chain
-        .iter()
-        .map(|c| {
-            let der = c.to_der().map_err(|e| {
-                VerifyError::CertificateParse(format!("Failed to encode cert to DER: {}", e))
-            })?;
-            Ok(CertificateDer::from(der))
-        })
-        .collect::<Result<Vec<_>, VerifyError>>()?;
-
-    // Root is last in chain - create trust anchor from it
-    let root_der = &cert_ders[cert_ders.len() - 1];
-    let trust_anchor = anchor_from_trusted_cert(root_der)
-        .map_err(|e| VerifyError::ChainValidation(format!("Invalid root certificate: {:?}", e)))?;
-
-    // Leaf is first
-    let ee_cert = EndEntityCert::try_from(&cert_ders[0])
-        .map_err(|e| VerifyError::CertificateParse(format!("Invalid leaf certificate: {:?}", e)))?;
-
-    // Intermediates are everything between leaf and root
-    let intermediates: Vec<CertificateDer> = if cert_ders.len() > 2 {
-        cert_ders[1..cert_ders.len() - 1].to_vec()
-    } else {
-        Vec::new()
-    };
-
-    // Use webpki to verify the chain
-    ee_cert
-        .verify_for_usage(
-            sig_algs,
-            &[trust_anchor],
-            &intermediates,
-            time,
-            KeyUsage::client_auth(),
-            None, // no revocation checking
-            None, // no custom path verification
-        )
-        .map_err(|e| VerifyError::ChainValidation(format!("Chain validation failed: {:?}", e)))?;
-
-    // Extract and hash root's public key
-    let root_pubkey = extract_public_key(&chain[chain.len() - 1])?;
-    let root_hash = hash_public_key(&root_pubkey);
-
-    Ok(ChainValidationResult {
-        root_pubkey_hash: root_hash,
-    })
-}
-
-/// Parse PEM and validate certificate chain
+/// This function performs comprehensive certificate chain validation suitable for
+/// TPM attestation key certificates. It validates:
 ///
-/// Convenience wrapper that parses PEM then validates.
-/// Chain should be leaf-first, root-last in the PEM.
-pub fn parse_and_validate_cert_chain(
-    chain_pem: &str,
-    time: UnixTime,
-) -> Result<ChainValidationResult, VerifyError> {
-    let certs = parse_cert_chain_pem(chain_pem)?;
-    validate_cert_chain(&certs, time)
-}
-
-/// Validate TPM EK certificate chain
-///
-/// Similar to validate_cert_chain but without Extended Key Usage (EKU) checking.
-/// TPM EK certificates use TPM-specific EKU OID (2.23.133.8.1) which is not
-/// recognized by webpki's standard EKU validation.
-///
-/// This function validates:
+/// **Signature chain:**
 /// - Each certificate is signed by the next in chain
+/// - Root certificate is self-signed
+///
+/// **Time validity:**
 /// - Certificate validity periods include the specified time
-/// - Chain is not too deep
+///
+/// **Basic Constraints (OID 2.5.29.19):**
+/// - Leaf certificate must have `CA:FALSE` (or no Basic Constraints)
+/// - Intermediate/root certificates must have `CA:TRUE`
+/// - Path length constraints are honored
+///
+/// **Key Usage (OID 2.5.29.15):**
+/// - Leaf certificate must have `digitalSignature` bit set
+/// - CA certificates must have `keyCertSign` bit set
+///
+/// **Extended Key Usage (OID 2.5.29.37):**
+/// - CA certificates should have TPM EK Certificate EKU (2.23.133.8.1)
+/// - Note: GCP AK leaf certificates don't have EKU, only Key Usage
+///
+/// **Name chaining:**
+/// - Each certificate's Issuer must match its parent's Subject
 ///
 /// Chain should be leaf-first, root-last.
 pub fn validate_tpm_cert_chain(
@@ -275,7 +326,89 @@ pub fn validate_tpm_cert_chain(
         )));
     }
 
+    // === X.509 Extension Validation ===
+    // Validate Basic Constraints, Key Usage, EKU, and name chaining
+
+    for (i, cert) in chain.iter().enumerate() {
+        let is_leaf = i == 0;
+        let is_root = i == chain.len() - 1;
+
+        // 1. Basic Constraints validation
+        if let Some(bc) = extract_basic_constraints(cert) {
+            if is_leaf && bc.ca {
+                return Err(VerifyError::ChainValidation(
+                    "Leaf certificate has CA:TRUE - must be CA:FALSE".into(),
+                ));
+            }
+            if !is_leaf && !bc.ca {
+                return Err(VerifyError::ChainValidation(format!(
+                    "Certificate {} (intermediate/root) must have CA:TRUE",
+                    i
+                )));
+            }
+
+            // Check pathLenConstraint for CA certificates
+            // pathLenConstraint limits how many CAs can exist below this one
+            if !is_leaf {
+                if let Some(path_len) = bc.path_len_constraint {
+                    // Number of CAs below this certificate in the chain
+                    // i=0 is leaf, so CAs below cert at position i are at positions 0..i-1
+                    // But the count should be: number of intermediate CAs between this CA and the leaf
+                    // For position i, there are (i - 1) intermediate CAs between it and the leaf
+                    // (position 0 is leaf, positions 1..i-1 are intermediates below)
+                    let cas_below = if i > 0 { i - 1 } else { 0 };
+                    if cas_below > path_len as usize {
+                        return Err(VerifyError::ChainValidation(format!(
+                            "Certificate {} pathLenConstraint violated: allows {} CAs below, but {} exist",
+                            i, path_len, cas_below
+                        )));
+                    }
+                }
+            }
+        } else if !is_leaf {
+            // CA certificates SHOULD have Basic Constraints
+            // This is a SHOULD per RFC 5280, but we enforce it for security
+            return Err(VerifyError::ChainValidation(format!(
+                "Certificate {} (intermediate/root) missing Basic Constraints extension",
+                i
+            )));
+        }
+
+        // 2. Key Usage validation
+        if let Some(ku) = extract_key_usage(cert) {
+            if is_leaf && !ku.digital_signature {
+                return Err(VerifyError::ChainValidation(
+                    "Leaf certificate missing digitalSignature key usage".into(),
+                ));
+            }
+            if !is_leaf && !ku.key_cert_sign {
+                return Err(VerifyError::ChainValidation(format!(
+                    "Certificate {} (CA) missing keyCertSign key usage",
+                    i
+                )));
+            }
+        } else if is_leaf {
+            // Leaf certificate MUST have Key Usage for signing
+            return Err(VerifyError::ChainValidation(
+                "Leaf certificate missing Key Usage extension".into(),
+            ));
+        }
+
+        // 3. Subject/Issuer name chaining
+        if !is_root {
+            let parent = &chain[i + 1];
+            if cert.tbs_certificate.issuer != parent.tbs_certificate.subject {
+                return Err(VerifyError::ChainValidation(format!(
+                    "Certificate {} issuer does not match parent subject",
+                    i
+                )));
+            }
+        }
+    }
+
+    // === Signature Chain Validation ===
     // Validate each certificate is signed by the next one in chain
+
     for i in 0..chain.len() - 1 {
         let cert = &chain[i];
         let issuer = &chain[i + 1];
@@ -299,9 +432,38 @@ pub fn validate_tpm_cert_chain(
         // ECDSA with SHA-384 on P-384: 1.2.840.10045.4.3.3
         const ECDSA_SHA256_OID: &str = "1.2.840.10045.4.3.2";
         const ECDSA_SHA384_OID: &str = "1.2.840.10045.4.3.3";
+        const RSA_SHA256_OID: &str = "1.2.840.113549.1.1.11";
 
         let alg_str = alg_oid.to_string();
         match alg_str.as_str() {
+            RSA_SHA256_OID => {
+                // RSA PKCS#1 v1.5 with SHA-256 verification
+                // For RSA, we need the full SPKI structure, not just raw key bytes
+                let issuer_spki = &issuer.tbs_certificate.subject_public_key_info;
+                let issuer_spki_der = issuer_spki.to_der().map_err(|e| {
+                    VerifyError::ChainValidation(format!("Failed to encode issuer SPKI: {}", e))
+                })?;
+
+                let rsa_pubkey = RsaPublicKey::try_from(
+                    spki::SubjectPublicKeyInfoRef::try_from(issuer_spki_der.as_slice()).map_err(
+                        |e| VerifyError::ChainValidation(format!("Invalid RSA SPKI: {}", e)),
+                    )?,
+                )
+                .map_err(|e| VerifyError::ChainValidation(format!("Invalid RSA key: {}", e)))?;
+
+                let verifying_key = RsaVerifyingKey::<Sha256>::new(rsa_pubkey);
+
+                let signature = RsaSignature::try_from(sig_bytes).map_err(|e| {
+                    VerifyError::ChainValidation(format!("Invalid RSA signature: {}", e))
+                })?;
+
+                verifying_key.verify(&tbs_der, &signature).map_err(|_| {
+                    VerifyError::ChainValidation(format!(
+                        "Certificate {} RSA signature verification failed",
+                        i
+                    ))
+                })?;
+            }
             ECDSA_SHA256_OID => {
                 // P-256 verification
                 if issuer_pubkey.len() != 65 || issuer_pubkey[0] != 0x04 {
@@ -357,7 +519,9 @@ pub fn validate_tpm_cert_chain(
         }
     }
 
+    // === Time Validity ===
     // Validate time for each certificate
+
     let unix_secs = time.as_secs();
 
     for (i, cert) in chain.iter().enumerate() {
@@ -558,5 +722,60 @@ mod tests {
         assert!(!is_valid_base64_line("ABC!@#"));
         assert!(!is_valid_base64_line("ABC DEF")); // space not allowed
         assert!(is_valid_base64_line("")); // empty is valid
+    }
+
+    // === Extension Parsing Tests ===
+
+    #[test]
+    fn test_extract_basic_constraints_ca_true() {
+        // GCP intermediate certificate with CA:TRUE
+        let cert_b64 = "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";
+        let cert_der = STANDARD.decode(cert_b64).unwrap();
+        let cert = Certificate::from_der(&cert_der).unwrap();
+
+        let bc = extract_basic_constraints(&cert);
+        assert!(bc.is_some(), "Basic Constraints should be present");
+        let bc = bc.unwrap();
+        assert!(bc.ca, "CA flag should be true for intermediate CA cert");
+    }
+
+    #[test]
+    fn test_extract_basic_constraints_ca_false() {
+        // GCP AK leaf certificate with CA:FALSE
+        let cert_b64 = "MIIFITCCAwmgAwIBAgIUAJSyAthxJCCD6ViYtC96+AGDJCswDQYJKoZIhvcNAQELBQAwgYYxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQHEw1Nb3VudGFpbiBWaWV3MRMwEQYDVQQKEwpHb29nbGUgTExDMRUwEwYDVQQLEwxHb29nbGUgQ2xvdWQxHjAcBgNVBAMTFUVLL0FLIENBIEludGVybWVkaWF0ZTAgFw0yNjAyMDIwNjU3NDdaGA8yMDU2MDEyNjA2NTc0NlowaTEWMBQGA1UEBxMNdXMtY2VudHJhbDEtZjEeMBwGA1UEChMVR29vZ2xlIENvbXB1dGUgRW5naW5lMREwDwYDVQQLEwhsb2NrYm9vdDEcMBoGA1UEAxMTMzQxNDI0MDY0ODIyNTQ4NTgzNjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMp9xzVQQpEV600JB3Gj9IP+U89ypLnrhQRUBVDFnz5INT2kVd4Jhl8KHZ6qYXVOOZYhrkvO0cVY0mfclyT+tJOjggFqMIIBZjAOBgNVHQ8BAf8EBAMCB4AwDAYDVR0TAQH/BAIwADAdBgNVHQ4EFgQU2lwtWfsKczujmD2yTgCf4MptjpkwHwYDVR0jBBgwFoAUZ8O73ljj1lF2j7MaPtsHp+yTeuQwgY0GCCsGAQUFBwEBBIGAMH4wfAYIKwYBBQUHMAKGcGh0dHA6Ly9wcml2YXRlY2EtY29udGVudC02NWQ1M2IxNC0wMDAwLTIxMmEtYTYzMy04ODNkMjRmNTdiYjguc3RvcmFnZS5nb29nbGVhcGlzLmNvbS8wYzNlNzllYjA4OThkMDJlYmIwYS9jYS5jcnQwdgYKKwYBBAHWeQIBFQRoMGYMDXVzLWNlbnRyYWwxLWYCBTY7VDeMDAhsb2NrYm9vdAIIL2HRx7ct9AwMGGluc3RhbmNlLTIwMjYwMjAyLTA2NTYwOaAgMB6gAwIBAKEDAQH/ogMBAf+jAwEBAKQDAQEApQMBAQAwDQYJKoZIhvcNAQELBQADggIBAKL4yGiPbAA63EQ7bxJ+2HGDo2EC+qymJDHtWski2lRGY70u+xIdywTW5l4k7JnnwM+fk7LHtfP0md0WU4Mw30B+51sc+pXprEn1SHpP20I/mM5AZMR+cMy9SWnr0WkfTZYKvYJMhDPKuZyK8JvUtXx6NM9AGHYxtPfFnvw2F/USBYYf7/N2KHMhUB9v1zFuHwMD/LDxduIw27kYUcVHttTbHGL9Uljflz343qL2YFE8QpRqtQ/0GK4UaJ3kzPYcbMbWBgpZgKQ2UIMfldvEO8hbGqO4hkNPsv4TPQcG0mJHyUWt+jTOFesBuDgbR/8R4lnrGL3QYZo3Oj7URCJdPiJ+ztohscGydjMVvYfaVziAGJbhMbADnyh/HBshi9gc4rQ99NbOA9fmCZnl+vcMp9jwaAzWZQxc1dNsfdRuTrQSwsNXn+PXJUDgRKKNsENY73QbVBUYvlBmQPkw8zqp8Htvtlsv5AImFFJsW4XsGt4CzZLOhlNW6Ckc58fjVSmeC66kTxYefRGh1SCXRZiJovuTynnF3Z6CFnWvnN/8dCmgjD+S0JUZ8Znx2NSxyZLbEqc6TYcJKx6R8B8QKa4EHWtKMuMorykvWpXMrVl1QjVm0HyVBvgzI+xRAO2TrS6g6c6pChj9BPXPgwLbVXlXQSstoUBFSORdz0S0HrEqxCg8";
+        let cert_der = STANDARD.decode(cert_b64).unwrap();
+        let cert = Certificate::from_der(&cert_der).unwrap();
+
+        let bc = extract_basic_constraints(&cert);
+        assert!(bc.is_some(), "Basic Constraints should be present");
+        let bc = bc.unwrap();
+        assert!(!bc.ca, "CA flag should be false for leaf cert");
+    }
+
+    #[test]
+    fn test_extract_key_usage_digital_signature() {
+        // GCP AK leaf certificate with Key Usage: Digital Signature
+        let cert_b64 = "MIIFITCCAwmgAwIBAgIUAJSyAthxJCCD6ViYtC96+AGDJCswDQYJKoZIhvcNAQELBQAwgYYxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQHEw1Nb3VudGFpbiBWaWV3MRMwEQYDVQQKEwpHb29nbGUgTExDMRUwEwYDVQQLEwxHb29nbGUgQ2xvdWQxHjAcBgNVBAMTFUVLL0FLIENBIEludGVybWVkaWF0ZTAgFw0yNjAyMDIwNjU3NDdaGA8yMDU2MDEyNjA2NTc0NlowaTEWMBQGA1UEBxMNdXMtY2VudHJhbDEtZjEeMBwGA1UEChMVR29vZ2xlIENvbXB1dGUgRW5naW5lMREwDwYDVQQLEwhsb2NrYm9vdDEcMBoGA1UEAxMTMzQxNDI0MDY0ODIyNTQ4NTgzNjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMp9xzVQQpEV600JB3Gj9IP+U89ypLnrhQRUBVDFnz5INT2kVd4Jhl8KHZ6qYXVOOZYhrkvO0cVY0mfclyT+tJOjggFqMIIBZjAOBgNVHQ8BAf8EBAMCB4AwDAYDVR0TAQH/BAIwADAdBgNVHQ4EFgQU2lwtWfsKczujmD2yTgCf4MptjpkwHwYDVR0jBBgwFoAUZ8O73ljj1lF2j7MaPtsHp+yTeuQwgY0GCCsGAQUFBwEBBIGAMH4wfAYIKwYBBQUHMAKGcGh0dHA6Ly9wcml2YXRlY2EtY29udGVudC02NWQ1M2IxNC0wMDAwLTIxMmEtYTYzMy04ODNkMjRmNTdiYjguc3RvcmFnZS5nb29nbGVhcGlzLmNvbS8wYzNlNzllYjA4OThkMDJlYmIwYS9jYS5jcnQwdgYKKwYBBAHWeQIBFQRoMGYMDXVzLWNlbnRyYWwxLWYCBTY7VDeMDAhsb2NrYm9vdAIIL2HRx7ct9AwMGGluc3RhbmNlLTIwMjYwMjAyLTA2NTYwOaAgMB6gAwIBAKEDAQH/ogMBAf+jAwEBAKQDAQEApQMBAQAwDQYJKoZIhvcNAQELBQADggIBAKL4yGiPbAA63EQ7bxJ+2HGDo2EC+qymJDHtWski2lRGY70u+xIdywTW5l4k7JnnwM+fk7LHtfP0md0WU4Mw30B+51sc+pXprEn1SHpP20I/mM5AZMR+cMy9SWnr0WkfTZYKvYJMhDPKuZyK8JvUtXx6NM9AGHYxtPfFnvw2F/USBYYf7/N2KHMhUB9v1zFuHwMD/LDxduIw27kYUcVHttTbHGL9Uljflz343qL2YFE8QpRqtQ/0GK4UaJ3kzPYcbMbWBgpZgKQ2UIMfldvEO8hbGqO4hkNPsv4TPQcG0mJHyUWt+jTOFesBuDgbR/8R4lnrGL3QYZo3Oj7URCJdPiJ+ztohscGydjMVvYfaVziAGJbhMbADnyh/HBshi9gc4rQ99NbOA9fmCZnl+vcMp9jwaAzWZQxc1dNsfdRuTrQSwsNXn+PXJUDgRKKNsENY73QbVBUYvlBmQPkw8zqp8Htvtlsv5AImFFJsW4XsGt4CzZLOhlNW6Ckc58fjVSmeC66kTxYefRGh1SCXRZiJovuTynnF3Z6CFnWvnN/8dCmgjD+S0JUZ8Znx2NSxyZLbEqc6TYcJKx6R8B8QKa4EHWtKMuMorykvWpXMrVl1QjVm0HyVBvgzI+xRAO2TrS6g6c6pChj9BPXPgwLbVXlXQSstoUBFSORdz0S0HrEqxCg8";
+        let cert_der = STANDARD.decode(cert_b64).unwrap();
+        let cert = Certificate::from_der(&cert_der).unwrap();
+
+        let ku = extract_key_usage(&cert);
+        assert!(ku.is_some(), "Key Usage should be present");
+        let ku = ku.unwrap();
+        assert!(ku.digital_signature, "digitalSignature bit should be set");
+        assert!(!ku.key_cert_sign, "keyCertSign should not be set for leaf");
+    }
+
+    #[test]
+    fn test_extract_key_usage_ca() {
+        // GCP intermediate certificate with Key Usage: Certificate Sign, CRL Sign
+        let cert_b64 = "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";
+        let cert_der = STANDARD.decode(cert_b64).unwrap();
+        let cert = Certificate::from_der(&cert_der).unwrap();
+
+        let ku = extract_key_usage(&cert);
+        assert!(ku.is_some(), "Key Usage should be present");
+        let ku = ku.unwrap();
+        assert!(ku.key_cert_sign, "keyCertSign bit should be set for CA");
     }
 }

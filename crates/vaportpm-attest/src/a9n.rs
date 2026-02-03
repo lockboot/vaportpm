@@ -3,43 +3,46 @@
 //! TPM attestation functionality
 //!
 //! Provides high-level attestation operations including:
-//! - Retrieving EK certificates from NV RAM
 //! - Creating and certifying attestation keys (AK)
 //! - Reading PCR values
 //! - Generating attestation documents
 
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-use crate::credential::compute_ecc_p256_name;
-use crate::{EkOps, NsmOps, NvOps, PcrOps, Tpm, TPM_RH_OWNER};
-use crate::{NV_INDEX_ECC_P256_EK_CERT, NV_INDEX_ECC_P384_EK_CERT, NV_INDEX_RSA_2048_EK_CERT};
+use crate::cert::{der_to_pem, fetch_cert_chain, DER_SEQUENCE_LONG};
+use crate::{KeyOps, NsmOps, NvOps, PcrOps, PublicKey, Tpm, TPM_RH_ENDORSEMENT, TPM_RH_OWNER};
 
-/// DER SEQUENCE tag with 2-byte length (0x30 0x82)
-/// Used to detect valid X.509 certificates in DER format
-const DER_SEQUENCE_LONG: [u8; 2] = [0x30, 0x82];
+/// GCP AK template NV index (RSA) - used for GCP detection
+const GCP_AK_TEMPLATE_NV_INDEX_RSA: u32 = 0x01c10001;
+/// GCP AK certificate NV index (ECC)
+const GCP_AK_CERT_NV_INDEX_ECC: u32 = 0x01c10002;
+/// GCP AK template NV index (ECC)
+const GCP_AK_TEMPLATE_NV_INDEX_ECC: u32 = 0x01c10003;
+/// GCP TPM manufacturer ID: "GOOG"
+const GCP_MANUFACTURER_GOOG: u32 = 0x474F4F47;
+/// TPM property: manufacturer
+const TPM_PT_MANUFACTURER: u32 = 0x00000105;
+
+/// Result type for attestation helper functions
+/// Contains: (ak_pubkeys, attestation_data, gcp_attestation, ak_handle)
+type AttestResult = (
+    HashMap<String, EccPublicKeyCoords>,
+    AttestationData,
+    Option<GcpAttestationData>,
+    Option<u32>,
+);
 
 /// Complete attestation output containing all TPM attestation data
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttestationOutput {
-    pub ek_certificates: EkCertificates,
+    /// Nonce/challenge used for this attestation (hex-encoded)
+    pub nonce: String,
     pub pcrs: HashMap<String, BTreeMap<u8, String>>,
-    pub ek_public_keys: HashMap<String, EccPublicKeyCoords>,
-    pub signing_key_public_keys: HashMap<String, EccPublicKeyCoords>,
+    /// Attestation Key public keys (hex-encoded ECC coordinates)
+    pub ak_pubkeys: HashMap<String, EccPublicKeyCoords>,
     pub attestation: AttestationContainer,
-}
-
-/// Endorsement Key certificates in PEM format
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EkCertificates {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rsa_2048: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ecc_p256: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ecc_p384: Option<String>,
 }
 
 /// ECC public key coordinates
@@ -49,122 +52,104 @@ pub struct EccPublicKeyCoords {
     pub y: String,
 }
 
-/// Container for both TPM and optional Nitro attestations
+/// Container for both TPM and optional platform-specific attestations
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttestationContainer {
     pub tpm: HashMap<String, AttestationData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nitro: Option<NitroAttestationData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gcp: Option<GcpAttestationData>,
 }
 
-/// TPM attestation data (certify response with NIZK proof)
+/// GCP Shielded VM attestation data
+///
+/// Contains the AK certificate chain from NV RAM.
+/// The AK is a long-term key provisioned by Google (not PCR-bound).
+/// The Quote data and signature are in `attestation.tpm`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GcpAttestationData {
+    /// AK certificate chain in PEM format (leaf first, root last)
+    pub ak_cert_chain: String,
+}
+
+/// TPM attestation data (Quote response)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttestationData {
-    /// The nonce/challenge provided to the attestation (hex-encoded)
-    /// This is duplicated from attest_data.extraData for easy access.
-    /// Verification MUST check this matches the nonce in attest_data.
-    pub nonce: String,
-    /// TPM2B_ATTEST structure from TPM2_Certify (hex-encoded)
+    /// TPM2B_ATTEST structure from TPM2_Quote (hex-encoded)
     pub attest_data: String,
     /// ECDSA signature over attest_data (DER, hex-encoded)
     pub signature: String,
 }
 
 /// Nitro Enclave attestation data
+///
+/// The AK public key and nonce are inside the signed document,
+/// and also available at the top level of AttestationOutput.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NitroAttestationData {
-    pub public_key: String,
-    pub nonce: String,
+    /// COSE Sign1 NSM document (hex-encoded)
     pub document: String,
 }
 
-/// Convert DER-encoded data to PEM format
-pub fn der_to_pem(der: &[u8], label: &str) -> String {
-    let base64_encoded = STANDARD.encode(der);
-    let mut pem = format!("-----BEGIN {}-----\n", label);
-    for chunk in base64_encoded.as_bytes().chunks(64) {
-        pem.push_str(std::str::from_utf8(chunk).unwrap());
-        pem.push('\n');
+/// Detect if running on GCP Shielded VM
+///
+/// Detection based on:
+/// 1. TPM manufacturer ID is "GOOG"
+/// 2. GCP AK template NV index exists
+fn is_gcp_tpm(tpm: &mut Tpm) -> bool {
+    // Check manufacturer
+    if let Ok(manufacturer) = tpm.get_property(TPM_PT_MANUFACTURER) {
+        if manufacturer == GCP_MANUFACTURER_GOOG {
+            // Verify AK template exists
+            if tpm.nv_readpublic(GCP_AK_TEMPLATE_NV_INDEX_RSA).is_ok() {
+                return true;
+            }
+        }
     }
-    pem.push_str(&format!("-----END {}-----\n", label));
-    pem
+    false
 }
 
 /// Generate a complete TPM attestation document
 ///
-/// This function:
-/// 1. Retrieves EK certificates from NV RAM
-/// 2. Creates the TCG standard EK (matches certificate public key)
-/// 3. Detects platform and chooses PCR bank (SHA-384 for Nitro, SHA-256 otherwise)
-/// 4. Reads PCR values from the chosen bank
-/// 5. Computes PCR policy and creates a signing key (AK) bound to it
-/// 6. AK self-certifies via TPM2_Certify (proves AK exists with this policy)
-/// 7. If on AWS Nitro, gets Nitro attestation binding the AK public key
+/// This function performs platform-specific TPM2_Quote attestation:
+///
+/// 1. Detects platform (Nitro or GCP)
+/// 2. Reads PCR values
+/// 3. Creates or retrieves AK (Attestation Key):
+///    - Nitro: Creates long-term AK (bound via Nitro NSM document)
+///    - GCP: Recreates AK from Google's template (bound via certificate chain)
+/// 4. Signs PCRs with TPM2_Quote
+/// 5. Includes platform-specific attestation:
+///    - Nitro: COSE Sign1 document binding AK public key
+///    - GCP: AK certificate chain from NV RAM
 ///
 /// # Arguments
 /// * `nonce` - User-provided nonce/challenge to include in attestation
 ///
 /// # Returns
 /// JSON-encoded attestation document containing all attestation data
+///
+/// # Errors
+/// Returns an error if the platform is not recognized (only AWS Nitro and GCP are supported)
 pub fn attest(nonce: &[u8]) -> Result<String> {
     let mut tpm = Tpm::open_direct()?;
 
-    // Step 1: Retrieve EK certificates from NV RAM
-    let mut ek_certs = EkCertificates {
-        rsa_2048: None,
-        ecc_p256: None,
-        ecc_p384: None,
-    };
-
-    // Try to read RSA EK cert
-    if let Ok(cert) = tpm.nv_read(NV_INDEX_RSA_2048_EK_CERT) {
-        if cert.starts_with(&DER_SEQUENCE_LONG) {
-            ek_certs.rsa_2048 = Some(der_to_pem(&cert, "CERTIFICATE"));
-        }
-    }
-
-    // Try to read ECC P-256 EK cert
-    if let Ok(cert) = tpm.nv_read(NV_INDEX_ECC_P256_EK_CERT) {
-        if cert.starts_with(&DER_SEQUENCE_LONG) {
-            ek_certs.ecc_p256 = Some(der_to_pem(&cert, "CERTIFICATE"));
-        }
-    }
-
-    // Try to read ECC P-384 EK cert
-    if let Ok(cert) = tpm.nv_read(NV_INDEX_ECC_P384_EK_CERT) {
-        if cert.starts_with(&DER_SEQUENCE_LONG) {
-            ek_certs.ecc_p384 = Some(der_to_pem(&cert, "CERTIFICATE"));
-        }
-    }
-
-    // Step 2: Create TCG standard EK (public key should match certificate)
-    // Note: Standard EK is decrypt-only, cannot sign. We use it only for
-    // identity verification (comparing public key with certificate).
-    let ek = tpm.create_standard_ek().context(
-        "Failed to create standard EK - endorsement hierarchy may require authentication",
-    )?;
-
-    let mut ek_public_keys = HashMap::new();
-    ek_public_keys.insert(
-        "ecc_p256".to_string(),
-        EccPublicKeyCoords {
-            x: hex::encode(&ek.public_key.x),
-            y: hex::encode(&ek.public_key.y),
-        },
-    );
-
-    // Step 3: Detect platform and choose PCR bank
-    // Nitro TPMs use SHA-384 for signed PCRs, so we bind AK to SHA-384 bank
-    // Other platforms use SHA-256
+    // Step 1: Detect platform
+    // GCP detection is cheap - just checks for NV index existence
     let is_nitro = tpm.is_nitro_tpm()?;
+    let is_gcp = !is_nitro && is_gcp_tpm(&mut tpm);
+
+    // Step 2: Read all allocated PCRs from all banks
+    let all_pcrs = tpm.read_all_allocated_pcrs()?;
+
+    // Choose PCR bank based on platform
+    // Nitro uses SHA-384 for signed PCRs, others use SHA-256
     let pcr_alg = if is_nitro {
         crate::TpmAlg::Sha384
     } else {
         crate::TpmAlg::Sha256
     };
-
-    // Step 4: Read all allocated PCRs from all banks
-    let all_pcrs = tpm.read_all_allocated_pcrs()?;
 
     // Get PCR values for the chosen bank
     let pcr_values: Vec<(u8, Vec<u8>)> = all_pcrs
@@ -177,18 +162,88 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
         return Err(anyhow!("No {:?} PCRs allocated on this TPM", pcr_alg));
     }
 
-    // Only include PCRs relevant to the chain of trust in output
+    // Build PCRs output
     let mut pcrs_by_alg: HashMap<String, BTreeMap<u8, String>> = HashMap::new();
     let pcr_map = pcrs_by_alg.entry(pcr_alg.name().to_string()).or_default();
     for (idx, value) in &pcr_values {
         pcr_map.insert(*idx, hex::encode(value));
     }
 
-    // Step 5: Compute policy from PCR values
-    let auth_policy = Tpm::calculate_pcr_policy_digest(&pcr_values, pcr_alg)?;
+    // Step 5: Create or retrieve AK and sign PCRs with TPM2_Quote
+    let (signing_key_public_keys, attestation_data, gcp_attestation, ak_handle) = if is_gcp {
+        // GCP path: recreate AK from Google's template
+        attest_gcp(&mut tpm, nonce, &pcr_values, pcr_alg)?
+    } else if is_nitro {
+        // Nitro path: create long-term AK, use TPM2_Quote
+        attest_nitro(&mut tpm, nonce, &pcr_values, pcr_alg)?
+    } else {
+        return Err(anyhow!(
+            "Unknown platform - only AWS Nitro and GCP Shielded VM are supported"
+        ));
+    };
 
-    // Create signing key (AK) bound to this policy
-    let signing_key = tpm.create_primary_ecc_key_with_policy(TPM_RH_OWNER, &auth_policy)?;
+    let mut tpm_attestations = HashMap::new();
+    tpm_attestations.insert("ecc_p256".to_string(), attestation_data);
+
+    // Step 6: Get Nitro attestation if on AWS
+    let nitro_attestation = if is_nitro {
+        if let Some(pk) = signing_key_public_keys.get("ecc_p256") {
+            let public_key_hex = format!("04{}{}", pk.x, pk.y);
+            let public_key_bytes = hex::decode(&public_key_hex)?;
+
+            match tpm.nsm_attest(
+                None,                   // user_data
+                Some(nonce.to_vec()),   // nonce
+                Some(public_key_bytes), // public_key
+            ) {
+                Ok(document) => Some(NitroAttestationData {
+                    document: hex::encode(&document),
+                }),
+                Err(_e) => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let attestation = AttestationContainer {
+        tpm: tpm_attestations,
+        nitro: nitro_attestation,
+        gcp: gcp_attestation,
+    };
+
+    // Cleanup TPM handles
+    if let Some(handle) = ak_handle {
+        tpm.flush_context(handle)?;
+    }
+
+    // Step 5: Build and output JSON
+    let output = AttestationOutput {
+        nonce: hex::encode(nonce),
+        pcrs: pcrs_by_alg,
+        ak_pubkeys: signing_key_public_keys,
+        attestation,
+    };
+
+    let json = serde_json::to_string_pretty(&output)?;
+
+    Ok(json)
+}
+
+/// Nitro attestation path: create long-term AK and use TPM2_Quote
+///
+/// Creates an AK without PCR binding (long-term key), then uses TPM2_Quote
+/// to sign the PCR values. The AK is bound to the Nitro NSM document instead.
+fn attest_nitro(
+    tpm: &mut Tpm,
+    nonce: &[u8],
+    pcr_values: &[(u8, Vec<u8>)],
+    pcr_alg: crate::TpmAlg,
+) -> Result<AttestResult> {
+    // Create long-term AK (no PCR binding - trust comes from Nitro NSM document)
+    let signing_key = tpm.create_primary_ecc_key(TPM_RH_OWNER)?;
 
     let mut signing_key_public_keys = HashMap::new();
     signing_key_public_keys.insert(
@@ -199,74 +254,120 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
         },
     );
 
-    // Compute AK name (used for PCR policy verification)
-    let _ak_name = compute_ecc_p256_name(
-        &signing_key.public_key.x,
-        &signing_key.public_key.y,
-        &auth_policy,
-    );
+    // Build PCR selection bitmap for Quote
+    let pcr_bitmap = build_pcr_bitmap(pcr_values);
+    let pcr_selection = vec![(pcr_alg, pcr_bitmap.as_slice())];
 
-    // Step 6: AK self-certifies via TPM2_Certify (produces TPM2B_ATTEST + signature)
-    // This produces TPM2B_ATTEST containing the AK's name (which includes authPolicy)
-    let cert_result = tpm.certify(
-        signing_key.handle, // object to certify (AK itself)
-        signing_key.handle, // signing key (AK)
-        nonce,              // qualifying data (becomes extraData in TPM2B_ATTEST)
-    )?;
+    // Perform TPM2_Quote - signs PCR values with AK
+    let quote_result = tpm.quote(signing_key.handle, nonce, &pcr_selection)?;
 
     let attestation_data = AttestationData {
-        nonce: hex::encode(nonce),
-        attest_data: hex::encode(&cert_result.attest_data),
-        signature: hex::encode(&cert_result.signature),
+        attest_data: hex::encode(&quote_result.attest_data),
+        signature: hex::encode(&quote_result.signature),
     };
 
-    let mut tpm_attestations = HashMap::new();
-    tpm_attestations.insert("ecc_p256".to_string(), attestation_data);
-
-    // Get Nitro attestation if available (we already detected Nitro earlier)
-    let nitro_attestation = if is_nitro {
-        // Encode signing key public key in SECG format (0x04 || X || Y)
-        let mut public_key_secg =
-            Vec::with_capacity(1 + signing_key.public_key.x.len() + signing_key.public_key.y.len());
-        public_key_secg.push(0x04); // Uncompressed point indicator
-        public_key_secg.extend_from_slice(&signing_key.public_key.x);
-        public_key_secg.extend_from_slice(&signing_key.public_key.y);
-
-        match tpm.nsm_attest(
-            None,                          // user_data
-            Some(nonce.to_vec()),          // nonce
-            Some(public_key_secg.clone()), // public_key
-        ) {
-            Ok(document) => Some(NitroAttestationData {
-                public_key: hex::encode(&public_key_secg),
-                nonce: hex::encode(nonce),
-                document: hex::encode(&document),
-            }),
-            Err(_e) => None,
-        }
-    } else {
-        None
-    };
-
-    let attestation = AttestationContainer {
-        tpm: tpm_attestations,
-        nitro: nitro_attestation,
-    };
-
-    // Cleanup TPM handles
-    tpm.flush_context(signing_key.handle)?;
-    tpm.flush_context(ek.handle)?;
-
-    // Step 7: Build and output JSON
-    let output = AttestationOutput {
-        ek_certificates: ek_certs,
-        pcrs: pcrs_by_alg,
-        ek_public_keys,
+    Ok((
         signing_key_public_keys,
-        attestation,
+        attestation_data,
+        None,
+        Some(signing_key.handle),
+    ))
+}
+
+/// GCP attestation path: recreate AK from template and use TPM2_Quote
+fn attest_gcp(
+    tpm: &mut Tpm,
+    nonce: &[u8],
+    pcr_values: &[(u8, Vec<u8>)],
+    pcr_alg: crate::TpmAlg,
+) -> Result<AttestResult> {
+    // Read ECC AK template from NV RAM (prefer ECC over RSA for ECDSA signing)
+    let ak_template = tpm.nv_read(GCP_AK_TEMPLATE_NV_INDEX_ECC)?;
+
+    // Recreate AK from template in endorsement hierarchy
+    let ak_result = tpm.create_primary_from_template(TPM_RH_ENDORSEMENT, &ak_template)?;
+
+    // Extract ECC public key coordinates
+    let signing_key_public_keys = match &ak_result.public_key {
+        PublicKey::Ecc(ecc) => {
+            let mut pks = HashMap::new();
+            pks.insert(
+                "ecc_p256".to_string(),
+                EccPublicKeyCoords {
+                    x: hex::encode(&ecc.x),
+                    y: hex::encode(&ecc.y),
+                },
+            );
+            pks
+        }
+        PublicKey::Rsa(_) => {
+            return Err(anyhow!(
+                "GCP ECC AK template unexpectedly created an RSA key"
+            ));
+        }
     };
 
-    let json = serde_json::to_string_pretty(&output)?;
+    // Build PCR selection bitmap for Quote
+    // Include all PCRs from pcr_values
+    let pcr_bitmap = build_pcr_bitmap(pcr_values);
+    let pcr_selection = vec![(pcr_alg, pcr_bitmap.as_slice())];
 
-    Ok(json)
+    // Perform TPM2_Quote - signs PCR values with AK
+    let quote_result = tpm.quote(ak_result.handle, nonce, &pcr_selection)?;
+
+    // Read AK certificate chain from NV RAM
+    let ak_cert_chain = read_gcp_ak_cert_chain(tpm)?;
+
+    let attestation_data = AttestationData {
+        attest_data: hex::encode(&quote_result.attest_data),
+        signature: hex::encode(&quote_result.signature),
+    };
+
+    let gcp_attestation = Some(GcpAttestationData { ak_cert_chain });
+
+    Ok((
+        signing_key_public_keys,
+        attestation_data,
+        gcp_attestation,
+        Some(ak_result.handle),
+    ))
+}
+
+/// Build PCR bitmap from list of (index, value) pairs
+fn build_pcr_bitmap(pcr_values: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    // TPM uses 3 bytes for PCR selection (24 PCRs max)
+    let mut bitmap = vec![0u8; 3];
+    for (idx, _) in pcr_values {
+        if *idx < 24 {
+            let byte_idx = (*idx / 8) as usize;
+            let bit_idx = *idx % 8;
+            bitmap[byte_idx] |= 1 << bit_idx;
+        }
+    }
+    bitmap
+}
+
+/// Read GCP ECC AK certificate chain from NV RAM and fetch issuer certs
+fn read_gcp_ak_cert_chain(tpm: &mut Tpm) -> Result<String> {
+    // Read ECC AK certificate (matches the ECC AK template we use)
+    let ak_cert = tpm.nv_read(GCP_AK_CERT_NV_INDEX_ECC)?;
+
+    if !ak_cert.starts_with(&DER_SEQUENCE_LONG) {
+        return Err(anyhow!(
+            "GCP AK certificate is not in DER format (got {:02x?})",
+            &ak_cert[..ak_cert.len().min(4)]
+        ));
+    }
+
+    // Build full chain by fetching issuer certs via AIA
+    let chain = fetch_cert_chain(&ak_cert)?;
+
+    // Convert all certs to PEM and concatenate
+    let pem_chain: String = chain
+        .iter()
+        .map(|cert| der_to_pem(cert, "CERTIFICATE"))
+        .collect::<Vec<_>>()
+        .join("");
+
+    Ok(pem_chain)
 }
