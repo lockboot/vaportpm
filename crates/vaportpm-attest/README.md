@@ -5,8 +5,8 @@ Produces a self-contained attestation document from a cloud vTPM. The output can
 ```rust
 use vaportpm_attest::attest;
 
-let output = attest(nonce, user_data)?;
-// output.to_json() -> send to verifier
+let json = attest(nonce)?;
+// Send json to verifier
 ```
 
 The library auto-detects the cloud platform (AWS Nitro, GCP Confidential VM) and produces a JSON document containing:
@@ -192,7 +192,7 @@ Supports multiple PCR banks:
 The library generates TPM2_Quote attestations signed by a long-lived Attestation Key (AK). The AK's authenticity is proven via platform-specific trust anchors:
 
 - **AWS Nitro**: The AK public key is embedded in a Nitro attestation document (via `nsm_attest`), which is signed by Amazon's Nitro CA chain.
-- **GCP Shielded VM**: The AK has a certificate stored in TPM NV RAM, signed by Google's CA chain.
+- **GCP Confidential VM**: The AK has a certificate stored in TPM NV RAM, signed by Google's CA chain.
 
 Both paths produce a TPM2_Quote (signed PCR values + nonce) that can be verified against the platform's root of trust.
 

@@ -14,6 +14,8 @@ use der::Decode;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
+use x509_cert::ext::pkix::name::GeneralName;
+use x509_cert::ext::pkix::{AuthorityInfoAccessSyntax, AuthorityKeyIdentifier};
 use x509_cert::Certificate;
 
 /// DER SEQUENCE tag with 2-byte length (0x30 0x82)
@@ -109,65 +111,11 @@ pub fn extract_aki(cert_der: &[u8]) -> Option<Vec<u8>> {
 
     for ext in extensions.iter() {
         if ext.extn_id == OID_AUTHORITY_KEY_IDENTIFIER {
-            // AuthorityKeyIdentifier ::= SEQUENCE {
-            //   keyIdentifier [0] KeyIdentifier OPTIONAL,
-            //   authorityCertIssuer [1] GeneralNames OPTIONAL,
-            //   authorityCertSerialNumber [2] CertificateSerialNumber OPTIONAL
-            // }
-            let bytes = ext.extn_value.as_bytes();
-            return parse_aki_extension(bytes);
+            let aki = AuthorityKeyIdentifier::from_der(ext.extn_value.as_bytes()).ok()?;
+            return aki.key_identifier.map(|ki| ki.as_bytes().to_vec());
         }
     }
     None
-}
-
-/// Parse the AuthorityKeyIdentifier extension value
-fn parse_aki_extension(bytes: &[u8]) -> Option<Vec<u8>> {
-    // AuthorityKeyIdentifier ::= SEQUENCE { keyIdentifier [0] IMPLICIT OCTET STRING, ... }
-    // bytes is the raw extension value
-
-    // Skip SEQUENCE header
-    if bytes.first()? != &0x30 {
-        return None;
-    }
-    let (seq_len, seq_start) = parse_der_length(&bytes[1..])?;
-    let seq_bytes = bytes.get(1 + seq_start..1 + seq_start + seq_len)?;
-
-    if seq_bytes.is_empty() {
-        return None;
-    }
-
-    // keyIdentifier is [0] IMPLICIT OCTET STRING
-    // Tag 0x80 = context-specific, primitive, tag 0
-    if seq_bytes[0] == 0x80 {
-        let (len, value_start) = parse_der_length(&seq_bytes[1..])?;
-        return Some(
-            seq_bytes
-                .get(1 + value_start..1 + value_start + len)?
-                .to_vec(),
-        );
-    }
-    None
-}
-
-/// Parse DER length encoding, returns (length, bytes_consumed)
-fn parse_der_length(bytes: &[u8]) -> Option<(usize, usize)> {
-    let len_byte = *bytes.first()?;
-    if len_byte & 0x80 == 0 {
-        // Short form
-        Some((len_byte as usize, 1))
-    } else {
-        // Long form
-        let num_bytes = (len_byte & 0x7F) as usize;
-        if num_bytes == 0 || num_bytes > 4 {
-            return None;
-        }
-        let mut len = 0usize;
-        for i in 0..num_bytes {
-            len = (len << 8) | (*bytes.get(1 + i)? as usize);
-        }
-        Some((len, 1 + num_bytes))
-    }
 }
 
 /// Extract Authority Information Access URL (caIssuers) from a DER certificate
@@ -177,54 +125,17 @@ pub fn extract_aia_url(cert_der: &[u8]) -> Option<String> {
 
     for ext in extensions.iter() {
         if ext.extn_id == OID_AUTHORITY_INFO_ACCESS {
-            return parse_aia_extension(ext.extn_value.as_bytes());
-        }
-    }
-    None
-}
-
-/// Parse the AuthorityInfoAccessSyntax extension to find caIssuers URL
-fn parse_aia_extension(bytes: &[u8]) -> Option<String> {
-    // AuthorityInfoAccessSyntax ::= SEQUENCE OF AccessDescription
-    // AccessDescription ::= SEQUENCE { accessMethod OID, accessLocation GeneralName }
-
-    // Skip outer SEQUENCE header
-    if bytes.first()? != &0x30 {
-        return None;
-    }
-    let (seq_len, seq_start) = parse_der_length(&bytes[1..])?;
-    let mut pos = 1 + seq_start;
-    let seq_end = pos + seq_len;
-
-    while pos < seq_end && pos < bytes.len() {
-        // Each AccessDescription is a SEQUENCE
-        if bytes.get(pos)? != &0x30 {
-            break;
-        }
-        let (desc_len, desc_header) = parse_der_length(&bytes[pos + 1..])?;
-        let desc_start = pos + 1 + desc_header;
-        let desc_end = desc_start + desc_len;
-
-        // Parse the OID at the start of the description
-        if let Ok(oid) = ObjectIdentifier::from_der(&bytes[desc_start..desc_end]) {
-            if oid == OID_CA_ISSUERS {
-                // Skip past the OID to get the GeneralName
-                let oid_encoded_len = oid.as_bytes().len() + 2; // +2 for tag and length
-                let gn_start = desc_start + oid_encoded_len;
-
-                // GeneralName uniformResourceIdentifier [6] IA5String
-                // Tag 0x86 = context-specific, primitive, tag 6
-                if bytes.get(gn_start)? == &0x86 {
-                    let (url_len, url_header) = parse_der_length(&bytes[gn_start + 1..])?;
-                    let url_start = gn_start + 1 + url_header;
-                    let url_bytes = bytes.get(url_start..url_start + url_len)?;
-                    return String::from_utf8(url_bytes.to_vec()).ok();
+            let aia = AuthorityInfoAccessSyntax::from_der(ext.extn_value.as_bytes()).ok()?;
+            for access_desc in aia.0.iter() {
+                if access_desc.access_method == OID_CA_ISSUERS {
+                    if let GeneralName::UniformResourceIdentifier(uri) =
+                        &access_desc.access_location
+                    {
+                        return Some(uri.to_string());
+                    }
                 }
             }
         }
-
-        // Move to next AccessDescription
-        pos = desc_end;
     }
     None
 }
@@ -375,4 +286,55 @@ pub fn fetch_certificate(url: &str) -> Result<Vec<u8>> {
     }
 
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_aia_url_gcp_cert() {
+        // GCP AK leaf certificate with AIA extension
+        let pem = r#"-----BEGIN CERTIFICATE-----
+MIIFITCCAwmgAwIBAgIUAL1/11uaGzgty7zfCO9n8DJu4+AwDQYJKoZIhvcNAQEL
+BQAwgYYxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQH
+Ew1Nb3VudGFpbiBWaWV3MRMwEQYDVQQKEwpHb29nbGUgTExDMRUwEwYDVQQLEwxH
+b29nbGUgQ2xvdWQxHjAcBgNVBAMTFUVLL0FLIENBIEludGVybWVkaWF0ZTAgFw0y
+NjAyMDMwOTQyMzJaGA8yMDU2MDEyNzA5NDIzMVowaTEWMBQGA1UEBxMNdXMtY2Vu
+dHJhbDEtZjEeMBwGA1UEChMVR29vZ2xlIENvbXB1dGUgRW5naW5lMREwDwYDVQQL
+Ewhsb2NrYm9vdDEcMBoGA1UEAxMTMTUzNTM5ODk5NjkwNzY4NjkyOTBZMBMGByqG
+SM49AgEGCCqGSM49AwEHA0IABIr5m4cMPky5JjeOObhO+mxaAcGpJ+hctqM9ubgu
+sFyZR1agN7FCfYOW2anqx8PSpm+WXjDmzzl2GDm78mBLbn+jggFqMIIBZjAOBgNV
+HQ8BAf8EBAMCB4AwDAYDVR0TAQH/BAIwADAdBgNVHQ4EFgQU4sCEt4Oo4yYWVjKM
+xeblb7eXu7EwHwYDVR0jBBgwFoAUZ8O73ljj1lF2j7MaPtsHp+yTeuQwgY0GCCsG
+AQUFBwEBBIGAMH4wfAYIKwYBBQUHMAKGcGh0dHA6Ly9wcml2YXRlY2EtY29udGVu
+dC02NWQ1M2IxNC0wMDAwLTIxMmEtYTYzMy04ODNkMjRmNTdiYjguc3RvcmFnZS5n
+b29nbGVhcGlzLmNvbS8wYzNlNzllYjA4OThkMDJlYmIwYS9jYS5jcnQwdgYKKwYB
+BAHWeQIBFQRoMGYMDXVzLWNlbnRyYWwxLWYCBTY7VDeMDAhsb2NrYm9vdAIIFU7V
+QLcsfBEMGGluc3RhbmNlLTIwMjYwMjAzLTA5Mzk0OaAgMB6gAwIBAKEDAQH/ogMB
+Af+jAwEBAKQDAQEApQMBAQAwDQYJKoZIhvcNAQELBQADggIBACCm1YXV1f22GVPl
+IVL4JoNg1QCq+g5PzgPY9/afjriE8sAM/+Ebj/M96rUS+nFxYHpfzsxfW+4Y7Ko2
+O8BGQ4U5Og7Rt5rMyCe/g3qXrZhQIcXIJouXvOsI1G5njXI03kXac8I//IvyMzMr
+pxy2SxVQ1djFFQoRA6MF1R3F4cZ1OUcgTPFWAuYuF6rN+F9RSTDuzFpKlWVPfPHX
+K0s/eGv+zvlpzBXfX/ES7OAIomfVrmeXqdQYC+ZEJo8tG8eJlxBo8c8Y4GNQpo2I
+9O/kYiOdcjzz8F3OeGH6b1dp10uur02nfz/vH0vpkVLNKllm9swZ42i1sQkl0g7u
+/p6jSUwBEej54fDEOKj8yRvbuMd36w1bYFBtnkvQlKBCT1hStaAtbFilHuSqlMRm
+xVcyunIlN6udQJTKCWPgFsLHgxlUBASm1k0zWsoFjIH9SFHu+GglzK2v1RoHZA5P
+33xcxKVzw52TAuPJc4Za/iKmFiA647VXYbiCaKNPn/oi7rLHTUAQ2tj7SJRbJcSu
+/q4xg60z8JOX7rtSxCrXFOp9ys2WzxSCqx1aXnUU+Ng+TtImheoUue+Zk3v7Olen
+HysTF1gLzHRLvONeErG6mUoxbkFhVsbGfbBDoe3jojNMISreY9IsY2UgMVIdKqLH
+bPF0Yysi72AJB6iorXKFwC9f61s0
+-----END CERTIFICATE-----"#;
+
+        let der = pem_to_der(pem).expect("PEM decode should work");
+        let aia_url = extract_aia_url(&der);
+
+        assert!(aia_url.is_some(), "Should extract AIA URL from GCP cert");
+        let url = aia_url.unwrap();
+        assert!(
+            url.starts_with("http://privateca-content-"),
+            "URL should be GCP privateca URL"
+        );
+        assert!(url.ends_with("/ca.crt"), "URL should end with /ca.crt");
+    }
 }

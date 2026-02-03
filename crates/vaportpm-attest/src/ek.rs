@@ -19,6 +19,12 @@ pub trait KeyOps {
     /// Create a primary ECC P-256 signing key in the specified hierarchy
     fn create_primary_ecc_key(&mut self, hierarchy: u32) -> Result<PrimaryKeyResult>;
 
+    /// Create a restricted ECC P-256 Attestation Key (TCG-compliant AK profile)
+    ///
+    /// Creates a key with attributes: fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign
+    /// This matches the TCG AK profile and GCP's AK template.
+    fn create_restricted_ak(&mut self, hierarchy: u32) -> Result<PrimaryKeyResult>;
+
     /// Create a primary key from a raw TPMT_PUBLIC template
     ///
     /// This takes template bytes (as stored in NV RAM by cloud providers like GCP)
@@ -53,6 +59,59 @@ pub trait KeyOps {
 }
 
 impl KeyOps for Tpm {
+    fn create_restricted_ak(&mut self, hierarchy: u32) -> Result<PrimaryKeyResult> {
+        let public_area = build_restricted_ak_public_area();
+
+        let command = CommandBuffer::new()
+            .write_u32(hierarchy)
+            .write_auth_empty_pw()
+            // inSensitive (TPM2B_SENSITIVE_CREATE)
+            .write_u16(4)
+            .write_u16(0) // userAuth size = 0
+            .write_u16(0) // data size = 0
+            // inPublic (TPM2B_PUBLIC)
+            .write_tpm2b(&public_area)
+            // outsideInfo (TPM2B_DATA) - empty
+            .write_u16(0)
+            // creationPCR (TPML_PCR_SELECTION) - empty
+            .write_u32(0)
+            .finalize(TpmSt::Sessions, TpmCc::CreatePrimary);
+        let mut resp = self.transmit(&command)?;
+
+        // Parse response
+        let handle = resp.read_u32()?;
+        let parameter_size = resp.read_u32()?;
+
+        // Track where parameters start
+        let param_start = resp.offset();
+
+        // Read outPublic (TPM2B_PUBLIC)
+        let public_size = resp.read_u16()? as usize;
+        let public_data = resp.read_bytes(public_size)?;
+
+        // Parse the public key from the public area
+        let public_key = parse_ecc_public_key(public_data)?;
+
+        // Skip remaining CreatePrimary output parameters
+        let bytes_read = resp.offset() - param_start;
+        if bytes_read < parameter_size as usize {
+            let remaining = parameter_size as usize - bytes_read;
+            resp.read_bytes(remaining)?;
+        }
+
+        // Verify we read exactly parameter_size bytes
+        let final_bytes_read = resp.offset() - param_start;
+        if final_bytes_read != parameter_size as usize {
+            bail!(
+                "Parameter size mismatch: TPM said {} bytes, we read {} bytes",
+                parameter_size,
+                final_bytes_read
+            );
+        }
+
+        Ok(PrimaryKeyResult { handle, public_key })
+    }
+
     fn create_primary_ecc_key(&mut self, hierarchy: u32) -> Result<PrimaryKeyResult> {
         let public_area = build_ecc_public_area();
 
@@ -256,7 +315,38 @@ fn build_pcr_selection(selections: &[(TpmAlg, &[u8])]) -> Vec<u8> {
     buf
 }
 
-/// Build a TPM2B_PUBLIC structure for an ECC P-256 signing key
+/// Build a TPM2B_PUBLIC structure for a restricted ECC P-256 Attestation Key
+///
+/// Attributes: fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign (0x50072)
+/// This matches the TCG AK profile and GCP's AK template structure.
+fn build_restricted_ak_public_area() -> Vec<u8> {
+    let attrs = ObjectAttributes::new()
+        .fixed_tpm()
+        .fixed_parent()
+        .sensitive_data_origin()
+        .user_with_auth()
+        .restricted()
+        .sign_encrypt();
+
+    CommandBuffer::new()
+        // TPMT_PUBLIC
+        .write_u16(TpmAlg::Ecc as u16) // type
+        .write_u16(TpmAlg::Sha256 as u16) // nameAlg
+        .write_u32(attrs.value()) // objectAttributes
+        .write_u16(0) // authPolicy (empty)
+        // parameters (TPMS_ECC_PARMS)
+        .write_u16(TpmAlg::Null as u16) // symmetric
+        .write_u16(TpmAlg::EcDsa as u16) // scheme = ECDSA (required for restricted signing key)
+        .write_u16(TpmAlg::Sha256 as u16) // scheme hash = SHA256
+        .write_u16(TpmEccCurve::NistP256 as u16) // curveID
+        .write_u16(TpmAlg::Null as u16) // kdf
+        // unique (TPMS_ECC_POINT) - empty, TPM will generate
+        .write_u16(0) // x size
+        .write_u16(0) // y size
+        .into_vec()
+}
+
+/// Build a TPM2B_PUBLIC structure for an ECC P-256 signing key (unrestricted)
 fn build_ecc_public_area() -> Vec<u8> {
     let attrs = ObjectAttributes::new()
         .fixed_tpm()

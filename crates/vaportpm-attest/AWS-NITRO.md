@@ -44,10 +44,11 @@ This ensures a single, verifiable path from AWS hardware to the attested data.
 let is_nitro = tpm.is_nitro_tpm()?;
 let pcr_values = tpm.read_all_allocated_pcrs()?;  // Reads SHA-384 bank
 
-// 2. Create long-term AK (no PCR binding - trust via Nitro document)
-let ak = tpm.create_primary_ecc_key(TPM_RH_OWNER)?;
+// 2. Create restricted AK in endorsement hierarchy (TCG-compliant AK profile)
+let ak = tpm.create_restricted_ak(TPM_RH_ENDORSEMENT)?;
 
 // 3. Quote PCRs with AK (signs PCR values)
+// Note: nonce is caller-provided for freshness/replay protection
 let quote_result = tpm.quote(ak.handle, &nonce, &pcr_selection)?;
 
 // 4. Get Nitro attestation binding the AK public key
@@ -181,7 +182,7 @@ COSE_Sign1 = [
 }
 ```
 
-Note: Only SHA-384 PCRs are included because that's the bank bound to the AK and signed in the Nitro document.
+Note: Only SHA-384 PCRs are included because that's the bank signed in the Nitro document.
 
 ## References
 

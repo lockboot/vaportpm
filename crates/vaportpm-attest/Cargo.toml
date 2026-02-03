@@ -25,3 +25,7 @@ x509-cert = { workspace = true }
 [lib]
 name = "vaportpm_attest"
 path = "src/lib.rs"
+
+[[bin]]
+name = "vaportpm-attest"
+path = "src/bin/attest.rs"

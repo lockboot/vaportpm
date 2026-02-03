@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::cert::{der_to_pem, fetch_cert_chain, DER_SEQUENCE_LONG};
-use crate::{KeyOps, NsmOps, NvOps, PcrOps, PublicKey, Tpm, TPM_RH_ENDORSEMENT, TPM_RH_OWNER};
+use crate::{KeyOps, NsmOps, NvOps, PcrOps, PublicKey, Tpm, TPM_RH_ENDORSEMENT};
 
 /// GCP AK template NV index (RSA) - used for GCP detection
 const GCP_AK_TEMPLATE_NV_INDEX_RSA: u32 = 0x01c10001;
@@ -232,18 +232,19 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
     Ok(json)
 }
 
-/// Nitro attestation path: create long-term AK and use TPM2_Quote
+/// Nitro attestation path: create restricted AK and use TPM2_Quote
 ///
-/// Creates an AK without PCR binding (long-term key), then uses TPM2_Quote
-/// to sign the PCR values. The AK is bound to the Nitro NSM document instead.
+/// Creates a TCG-compliant restricted AK in the endorsement hierarchy, then uses
+/// TPM2_Quote to sign the PCR values. The AK is bound to the Nitro NSM document.
 fn attest_nitro(
     tpm: &mut Tpm,
     nonce: &[u8],
     pcr_values: &[(u8, Vec<u8>)],
     pcr_alg: crate::TpmAlg,
 ) -> Result<AttestResult> {
-    // Create long-term AK (no PCR binding - trust comes from Nitro NSM document)
-    let signing_key = tpm.create_primary_ecc_key(TPM_RH_OWNER)?;
+    // Create restricted AK in endorsement hierarchy (TCG-compliant AK profile)
+    // Trust comes from Nitro NSM document binding the AK public key
+    let signing_key = tpm.create_restricted_ak(TPM_RH_ENDORSEMENT)?;
 
     let mut signing_key_public_keys = HashMap::new();
     signing_key_public_keys.insert(

@@ -38,3 +38,7 @@ serde_json = { workspace = true }
 name = "vaportpm_verify"
 path = "src/lib.rs"
 
+[[bin]]
+name = "vaportpm-verify"
+path = "src/bin/verify.rs"
+

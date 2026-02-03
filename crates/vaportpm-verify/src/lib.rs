@@ -356,9 +356,8 @@ pub fn verify_attestation_json(json: &str) -> Result<VerificationResult, VerifyE
 mod tests {
     use super::*;
 
-    // Timestamp from the Nitro test fixture (when the Nitro certificates were valid)
-    // Extracted from Nitro document's timestamp field (milliseconds / 1000)
-    const NITRO_FIXTURE_TIMESTAMP_SECS: u64 = 1770017308;
+    // Timestamp for Nitro test fixture (Feb 3, 2026 11:00:00 UTC - within cert validity window)
+    const NITRO_FIXTURE_TIMESTAMP_SECS: u64 = 1770116400;
 
     // Timestamp for GCP test fixture (Feb 2, 2026 when certificates are valid)
     const GCP_FIXTURE_TIMESTAMP_SECS: u64 = 1770019200; // Feb 2, 2026 08:00:00 UTC

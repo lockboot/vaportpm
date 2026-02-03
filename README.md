@@ -28,7 +28,7 @@ You handle **policy decisions**:
 | Platform | Status | Trust Anchor |
 |----------|--------|--------------|
 | AWS EC2 with Nitro v4+ | ✅ Working | Nitro Root CA |
-| GCP Confidential VM | ✅ Working | Google AK certificate |
+| GCP Confidential VM | ✅ Working | Google EK/AK CA Root |
 | Azure Trusted Launch | 🔜 Planned | Microsoft AK certificate |
 
 Please note that GCP 'Shielded VM' with vTPM isn't enough, a 'Confidential VM' is necessary as Google doesn't provision AK certificates without that feature enabled (be it Intel TDX or AMD SEV)
@@ -47,15 +47,12 @@ let json = attest(b"challenge-nonce")?;
 ### Verify Attestation (anywhere)
 
 ```rust
-use vaportpm_verify::{verify_attestation_json, VerificationResult};
+use vaportpm_verify::verify_attestation_json;
 
 let result = verify_attestation_json(&json)?;
-
-// Check the trust root is acceptable
-if result.root_pubkey_hash == KNOWN_AWS_NITRO_ROOT_HASH {
-    println!("Verified via: {:?}", result.provider);
-    println!("Nonce: {}", result.nonce);
-}
+// Verification succeeded - attestation is from a supported cloud provider
+println!("Provider: {:?}", result.provider);
+println!("PCRs: {:?}", result.pcrs);
 ```
 
 ## License

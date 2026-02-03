@@ -56,6 +56,36 @@ EK/AK CA Root (self-signed, offline)
 - **Key Usage**: `Digital Signature` (critical)
 - **Extended Key Usage**: None (only Key Usage is present)
 
+## AK Template (NV RAM)
+
+Google provisions an AK template at NV index `0x01c10003` (ECC) that defines the key properties.
+The template is a `TPMT_PUBLIC` structure:
+
+```
+type: ecc (0x23)
+nameAlg: sha256 (0x0b)
+attributes: fixedtpm|fixedparent|sensitivedataorigin|userwithauth|restricted|sign (0x50072)
+scheme: ecdsa with sha256
+curve: NIST P-256
+unique: <pre-computed x,y coordinates>
+```
+
+Key properties:
+
+| Attribute | Meaning |
+|-----------|---------|
+| `restricted` | Can only sign TPM-generated structures (Quotes, certifications) |
+| `sign` | Signing key (no decrypt capability) |
+| `fixedtpm` | Key cannot be duplicated outside this TPM |
+| `fixedparent` | Key cannot be moved to a different parent |
+
+The `unique` field contains pre-computed ECC coordinates. When `TPM2_CreatePrimary` is called
+with this template in the endorsement hierarchy, the TPM deterministically derives a key
+matching the certificate Google provisions at `0x01c10002`.
+
+This is a TCG-compliant Attestation Key profile: a restricted signing key in the endorsement
+hierarchy, bound to the platform via the EK seed.
+
 ## GCP Instance Identity Extension
 
 AK certificates include a custom extension that binds the certificate to the VM:
@@ -89,7 +119,7 @@ TPM2B_ATTEST {
     magic: 0xFF544347 ("TCG\xFF")
     type: TPM_ST_ATTEST_QUOTE (0x8018)
     qualifiedSigner: Hash of signing key name
-    extraData: Nonce (challenge from verifier)
+    extraData: Nonce passed to attest()
     clockInfo: TPM clock values
     firmwareVersion: TPM firmware version
     attested: TPMS_QUOTE_INFO {
@@ -99,7 +129,12 @@ TPM2B_ATTEST {
 }
 ```
 
-The signature is ECDSA over the DER-encoded attest structure.
+The signature is ECDSA over the TPM2B_ATTEST structure.
+
+The nonce in `extraData` is whatever value was passed to the `attest()` function. In a
+challenge-response protocol, this would be a verifier-provided challenge. The library
+itself is agnostic to how the nonce is generated or validated—that's up to the calling
+application's attestation flow.
 
 ## Verification Process
 
@@ -133,7 +168,7 @@ The signature is ECDSA over the DER-encoded attest structure.
 - The AK was created on a GCP Confidential VM vTPM certified by Google
 - The Quote was signed by that specific AK
 - PCR values were selected by the Quote at signing time
-- The nonce proves freshness (replay protection)
+- The nonce can prove freshness if verifier-provided (replay protection)
 
 ### What This Does NOT Validate
 
@@ -153,7 +188,7 @@ The signature is ECDSA over the DER-encoded attest structure.
 |--------|---------------------|-----------|
 | Trust Root | X.509 certificate chain | COSE-signed NSM document |
 | Key Binding | AK certificate includes VM identity | NSM document has public_key field |
-| PCR Source | TPM2_Quote | Nitro document + TPM2_Quote |
+| PCR Source | TPM2_Quote | Nitro document (nitrotpm_pcrs) |
 | Algorithm | ECDSA P-256 | ECDSA P-384 |
 
 ## References

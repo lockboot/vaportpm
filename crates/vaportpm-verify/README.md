@@ -91,11 +91,11 @@ The `time` parameter controls certificate validity checking. Use `UnixTime::now(
 Returns `VerificationResult` containing:
 - `nonce` - The verified challenge (hex)
 - `root_pubkey_hash` - SHA-256 of the trust anchor's public key (hex)
-- `method` - How verification was performed (currently only `Nitro`)
+- `provider` - Cloud provider (AWS, GCP)
 
 ## Security Considerations
 
-The library embeds the hashes of known Amazon & Google certificate authorities and verification will fail if it encounters an unknown root of trust, the full certificate chain must be provided in the attestation.
+The library embeds the CA root certificates of known Amazon & Google certificate authorities and verification will fail if it encounters an unknown root of trust. The full certificate chain must be provided in the attestation.
 
 However, beyond that it's up to the application to decide on the following:
 
