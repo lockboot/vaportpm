@@ -1,12 +1,14 @@
 #![no_main]
 
+use pki_types::UnixTime;
 use risc0_zkvm::guest::env;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use vaportpm_attest::a9n::AttestationOutput;
-use vaportpm_verify::{verify_attestation_output, CloudProvider};
+use std::io::Read;
+use std::time::Duration;
+use vaportpm_verify::{flat, verify_decoded_attestation_output, CloudProvider};
 
 risc0_zkvm::guest::entry!(main);
 
@@ -18,46 +20,34 @@ pub struct ZkPublicInputs {
     pub ak_pubkey: [u8; 65],
     pub nonce: [u8; 32],
     pub provider: u8,
-    pub root_pubkey_hash: [u8; 32],
+    pub verified_at: u64,
 }
 
 fn main() {
-    // Read inputs from host
-    let attestation_json: String = env::read();
-    let time_secs: u64 = env::read();
+    // Read raw bytes - no serde deserialization!
+    let mut input_bytes = Vec::<u8>::new();
+    env::stdin().read_to_end(&mut input_bytes).unwrap();
 
-    // Parse attestation
-    let output: AttestationOutput =
-        serde_json::from_str(&attestation_json).expect("Failed to parse attestation JSON");
+    // Last 8 bytes are the verification timestamp
+    if input_bytes.len() < 8 {
+        panic!("Input too short - missing timestamp");
+    }
+    let time_bytes: [u8; 8] = input_bytes[input_bytes.len() - 8..].try_into().unwrap();
+    let time_secs = u64::from_le_bytes(time_bytes);
+    let time = UnixTime::since_unix_epoch(Duration::from_secs(time_secs));
 
-    // Run EXACT SAME verification as native
-    let time = pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(time_secs));
+    // Parse flat binary format (everything except the trailing timestamp)
+    let flat_data = &input_bytes[..input_bytes.len() - 8];
+    let decoded = flat::from_bytes(flat_data).expect("Failed to parse flat input");
+
+    // Verify using decoded path (no hex::decode, no PEM parsing)
     let result =
-        verify_attestation_output(&output, time).expect("Attestation verification failed");
+        verify_decoded_attestation_output(&decoded, time).expect("Attestation verification failed");
 
-    // Compute canonical PCR hash
-    let pcr_hash = compute_pcr_hash(&output.pcrs);
+    // Compute canonical PCR hash from pre-decoded binary data
+    let pcr_hash = compute_pcr_hash_decoded(&decoded.pcrs);
 
-    // Extract AK public key
-    let ak_pk = output.ak_pubkeys.get("ecc_p256").expect("Missing AK");
-    let mut ak_pubkey = [0u8; 65];
-    ak_pubkey[0] = 0x04;
-    let x_bytes = hex::decode(&ak_pk.x).expect("Invalid AK x coordinate");
-    let y_bytes = hex::decode(&ak_pk.y).expect("Invalid AK y coordinate");
-    ak_pubkey[1..33].copy_from_slice(&x_bytes);
-    ak_pubkey[33..65].copy_from_slice(&y_bytes);
-
-    // Parse nonce
-    let nonce_bytes = hex::decode(&output.nonce).expect("Invalid nonce");
-    let mut nonce = [0u8; 32];
-    nonce.copy_from_slice(&nonce_bytes);
-
-    // Parse root pubkey hash
-    let root_hash_bytes = hex::decode(&result.root_pubkey_hash).expect("Invalid root hash");
-    let mut root_pubkey_hash = [0u8; 32];
-    root_pubkey_hash.copy_from_slice(&root_hash_bytes);
-
-    // Map provider to u8
+    // Map provider to u8 (root hash already verified against known roots)
     let provider = match result.provider {
         CloudProvider::Aws => 0u8,
         CloudProvider::Gcp => 1u8,
@@ -66,43 +56,36 @@ fn main() {
     // Build and commit public inputs
     let public_inputs = ZkPublicInputs {
         pcr_hash,
-        ak_pubkey,
-        nonce,
+        ak_pubkey: decoded.ak_pubkey,
+        nonce: decoded.nonce,
         provider,
-        root_pubkey_hash,
+        verified_at: result.verified_at,
     };
 
     env::commit(&public_inputs);
 }
 
-/// Compute canonical PCR hash
+/// Compute canonical PCR hash from pre-decoded binary PCR data
 ///
-/// Canonicalization: sort by algorithm name, then by PCR index
-fn compute_pcr_hash(
-    pcrs: &std::collections::HashMap<String, BTreeMap<u8, String>>,
-) -> [u8; 32] {
+/// Canonicalization: sort by algorithm ID, then by PCR index
+fn compute_pcr_hash_decoded(pcrs: &BTreeMap<(u8, u8), Vec<u8>>) -> [u8; 32] {
     let mut hasher = Sha256::new();
 
-    // Sort algorithm names
-    let mut alg_names: Vec<_> = pcrs.keys().collect();
-    alg_names.sort();
+    // Group PCRs by algorithm
+    let mut by_alg: BTreeMap<u8, BTreeMap<u8, &Vec<u8>>> = BTreeMap::new();
+    for ((alg_id, idx), value) in pcrs {
+        by_alg.entry(*alg_id).or_default().insert(*idx, value);
+    }
 
-    for alg_name in alg_names {
-        let pcr_map = &pcrs[alg_name];
-
-        // Add algorithm name (length-prefixed)
-        hasher.update(&[alg_name.len() as u8]);
-        hasher.update(alg_name.as_bytes());
-
-        // Add PCR count
-        hasher.update(&[pcr_map.len() as u8]);
+    // Process in algorithm order (0=sha256, 1=sha384)
+    for (alg_id, pcr_map) in &by_alg {
+        // Add algorithm ID and PCR count (2 bytes total)
+        hasher.update(&[*alg_id, pcr_map.len() as u8]);
 
         // BTreeMap is already sorted by key
-        for (idx, value_hex) in pcr_map {
-            let value_bytes = hex::decode(value_hex).expect("valid hex");
+        for (idx, value_bytes) in pcr_map {
             hasher.update(&[*idx]);
-            hasher.update(&[value_bytes.len() as u8]);
-            hasher.update(&value_bytes);
+            hasher.update(*value_bytes);
         }
     }
 

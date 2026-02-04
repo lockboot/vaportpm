@@ -17,7 +17,8 @@ mod x509;
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 
 // Re-export error type
 pub use error::VerifyError;
@@ -27,9 +28,6 @@ pub use tpm::{parse_quote_attest, verify_ecdsa_p256, TpmQuoteInfo};
 
 // Re-export from vaportpm_attest
 pub use vaportpm_attest::TpmAlg;
-
-// Re-export Nitro types and functions
-pub use nitro::{verify_nitro_attestation, NitroDocument, NitroVerifyResult};
 
 // Re-export X.509 utility functions
 pub use x509::{
@@ -51,81 +49,40 @@ pub enum CloudProvider {
 
 /// Known root CA certificates and public key hashes for cloud providers
 ///
-/// Certificates are embedded from vaportpm_attest. Hashes are derived from
-/// the certificate data at runtime, not hardcoded separately.
+/// Hashes are pre-computed constants to avoid PEM parsing in zkVM guests.
 pub mod roots {
     use super::CloudProvider;
-    use crate::x509::{extract_public_key, hash_public_key, parse_cert_chain_pem};
-    use std::sync::OnceLock;
 
     // Re-export embedded root certificate PEMs from vaportpm_attest
-    // Note: Intermediates are project-specific and must be fetched by the attestor
     pub use vaportpm_attest::roots::{AWS_NITRO_ROOT_PEM, GCP_EKAK_ROOT_PEM};
 
     // Re-export SKI/AKI lookup
     pub use vaportpm_attest::roots::find_issuer_by_aki;
 
-    /// Cached root public key hashes (computed on first access)
-    static ROOT_HASHES: OnceLock<RootHashes> = OnceLock::new();
+    /// AWS Nitro Enclave Root CA public key hash (SHA-256, pre-computed)
+    pub const AWS_NITRO_ROOT_HASH: [u8; 32] = [
+        0xfb, 0x70, 0x59, 0x38, 0x0c, 0x01, 0xce, 0x83, 0x78, 0x53, 0x58, 0x08, 0x97, 0x1f, 0x48,
+        0xad, 0xb2, 0x61, 0x1f, 0x2d, 0x33, 0x2c, 0x9e, 0x18, 0xbb, 0xfa, 0x1b, 0x84, 0xcf, 0x7c,
+        0xad, 0xe2,
+    ];
 
-    struct RootHashes {
-        aws_nitro: String,
-        gcp_ekak_amd: String,
-    }
-
-    fn compute_root_hashes() -> RootHashes {
-        let aws_hash = compute_pubkey_hash(AWS_NITRO_ROOT_PEM).unwrap_or_default();
-        let gcp_amd_hash = compute_pubkey_hash(GCP_EKAK_ROOT_PEM).unwrap_or_default();
-
-        RootHashes {
-            aws_nitro: aws_hash,
-            gcp_ekak_amd: gcp_amd_hash,
-        }
-    }
-
-    fn compute_pubkey_hash(pem: &str) -> Option<String> {
-        let certs = parse_cert_chain_pem(pem).ok()?;
-        let cert = certs.first()?;
-        let pubkey = extract_public_key(cert).ok()?;
-        Some(hash_public_key(&pubkey))
-    }
-
-    fn get_hashes() -> &'static RootHashes {
-        ROOT_HASHES.get_or_init(compute_root_hashes)
-    }
-
-    /// AWS Nitro Enclave Root CA public key hash (SHA-256)
-    ///
-    /// Derived from the embedded AWS Nitro root certificate.
-    pub fn aws_nitro_root_hash() -> &'static str {
-        &get_hashes().aws_nitro
-    }
-
-    /// GCP Shielded VM EK/AK Root CA public key hash (SHA-256) - AMD/SEV
-    ///
-    /// Derived from the embedded GCP EK/AK root certificate for AMD instances.
-    pub fn gcp_ekak_root_amd_hash() -> &'static str {
-        &get_hashes().gcp_ekak_amd
-    }
+    /// GCP Shielded VM EK/AK Root CA public key hash (SHA-256, pre-computed)
+    pub const GCP_EKAK_ROOT_HASH: [u8; 32] = [
+        0x9a, 0xb8, 0x45, 0xee, 0x46, 0x63, 0x63, 0x8e, 0x86, 0x81, 0x29, 0xc7, 0xe8, 0xdd, 0x4b,
+        0x2a, 0x63, 0xa5, 0x12, 0x3f, 0xd8, 0x5d, 0x7b, 0x60, 0x28, 0x15, 0xa7, 0xc6, 0xc4, 0xad,
+        0xe7, 0x69,
+    ];
 
     /// Look up cloud provider from root public key hash
-    ///
-    /// Returns `Some(CloudProvider)` if the hash matches a known root CA,
-    /// or `None` if the root is not recognized.
-    pub fn provider_from_hash(hash: &str) -> Option<CloudProvider> {
-        let hashes = get_hashes();
-        if hash == hashes.aws_nitro {
+    #[inline]
+    pub fn provider_from_hash(hash: &[u8; 32]) -> Option<CloudProvider> {
+        if hash == &AWS_NITRO_ROOT_HASH {
             Some(CloudProvider::Aws)
-        } else if hash == hashes.gcp_ekak_amd {
+        } else if hash == &GCP_EKAK_ROOT_HASH {
             Some(CloudProvider::Gcp)
         } else {
             None
         }
-    }
-
-    /// Check if a public key hash matches a known trust anchor
-    pub fn is_known_root_hash(hash: &str) -> bool {
-        provider_from_hash(hash).is_some()
     }
 }
 
@@ -135,17 +92,146 @@ pub use vaportpm_attest::a9n::{
     GcpAttestationData, NitroAttestationData,
 };
 
+/// Binary attestation data - all fields already decoded from hex/PEM
+///
+/// This struct holds pre-decoded attestation data for efficient verification
+/// in constrained environments (e.g., zkVM guests) where text parsing is expensive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecodedAttestationOutput {
+    /// Nonce (32 bytes, already decoded from hex)
+    pub nonce: [u8; 32],
+
+    /// PCR values: (algorithm_id, pcr_index) → value
+    /// Algorithm IDs: 0 = SHA-256, 1 = SHA-384
+    pub pcrs: BTreeMap<(u8, u8), Vec<u8>>,
+
+    /// AK public key (65 bytes SEC1 uncompressed: 0x04 || x || y)
+    #[serde(with = "BigArray")]
+    pub ak_pubkey: [u8; 65],
+
+    /// TPM Quote attest_data (raw bytes)
+    pub quote_attest: Vec<u8>,
+
+    /// TPM Quote signature (raw DER bytes)
+    pub quote_signature: Vec<u8>,
+
+    /// Platform-specific attestation
+    pub platform: DecodedPlatformAttestation,
+}
+
+/// Platform-specific attestation data in decoded binary format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DecodedPlatformAttestation {
+    /// GCP: certificate chain as DER bytes (leaf first)
+    Gcp { cert_chain_der: Vec<Vec<u8>> },
+
+    /// Nitro: COSE document (raw bytes, already hex-decoded)
+    Nitro { document: Vec<u8> },
+}
+
+pub mod flat;
+
+impl DecodedAttestationOutput {
+    /// Decode an AttestationOutput to binary format
+    pub fn decode(output: &AttestationOutput) -> Result<Self, VerifyError> {
+        use der::Encode;
+
+        let nonce_bytes = hex::decode(&output.nonce)?;
+        let nonce: [u8; 32] = nonce_bytes
+            .try_into()
+            .map_err(|_| VerifyError::InvalidAttest("nonce must be 32 bytes".into()))?;
+
+        let ak_pk = output.ak_pubkeys.get("ecc_p256").ok_or_else(|| {
+            VerifyError::NoValidAttestation("missing ecc_p256 AK public key".into())
+        })?;
+        let ak_x = hex::decode(&ak_pk.x)?;
+        let ak_y = hex::decode(&ak_pk.y)?;
+        let mut ak_pubkey = [0u8; 65];
+        ak_pubkey[0] = 0x04;
+        ak_pubkey[1..33].copy_from_slice(&ak_x);
+        ak_pubkey[33..65].copy_from_slice(&ak_y);
+
+        let tpm = output.attestation.tpm.get("ecc_p256").ok_or_else(|| {
+            VerifyError::NoValidAttestation("missing ecc_p256 TPM attestation".into())
+        })?;
+        let quote_attest = hex::decode(&tpm.attest_data)?;
+        let quote_signature = hex::decode(&tpm.signature)?;
+
+        let mut pcrs = BTreeMap::new();
+        for (alg_name, pcr_map) in &output.pcrs {
+            let alg_id = match alg_name.as_str() {
+                "sha256" => 0u8,
+                "sha384" => 1u8,
+                _ => continue,
+            };
+            for (idx, hex_value) in pcr_map {
+                let value = hex::decode(hex_value)?;
+                pcrs.insert((alg_id, *idx), value);
+            }
+        }
+
+        let platform = if let Some(ref gcp) = output.attestation.gcp {
+            let certs = parse_cert_chain_pem(&gcp.ak_cert_chain)?;
+            let cert_chain_der: Vec<Vec<u8>> = certs
+                .iter()
+                .map(|c| c.to_der())
+                .collect::<Result<_, _>>()
+                .map_err(|e| {
+                    VerifyError::CertificateParse(format!("Failed to encode cert as DER: {}", e))
+                })?;
+            DecodedPlatformAttestation::Gcp { cert_chain_der }
+        } else if let Some(ref nitro) = output.attestation.nitro {
+            let document = hex::decode(&nitro.document)?;
+            DecodedPlatformAttestation::Nitro { document }
+        } else {
+            return Err(VerifyError::NoValidAttestation(
+                "no platform attestation".into(),
+            ));
+        };
+
+        Ok(DecodedAttestationOutput {
+            nonce,
+            pcrs,
+            ak_pubkey,
+            quote_attest,
+            quote_signature,
+            platform,
+        })
+    }
+}
+
+/// Verify pre-decoded attestation (for zkVM)
+/// Verify pre-decoded attestation
+///
+/// # Arguments
+/// * `decoded` - Pre-decoded attestation data
+/// * `time` - Verification timestamp for certificate validation
+pub fn verify_decoded_attestation_output(
+    decoded: &DecodedAttestationOutput,
+    time: UnixTime,
+) -> Result<VerificationResult, VerifyError> {
+    match &decoded.platform {
+        DecodedPlatformAttestation::Gcp { cert_chain_der } => {
+            gcp::verify_gcp_decoded(decoded, cert_chain_der, time)
+        }
+        DecodedPlatformAttestation::Nitro { document } => {
+            nitro::verify_nitro_decoded(decoded, document, time)
+        }
+    }
+}
+
 /// Result of successful attestation verification
 #[derive(Debug, Serialize)]
 pub struct VerificationResult {
-    /// The nonce that was verified (hex-encoded)
-    pub nonce: String,
+    /// The nonce that was verified (32 bytes)
+    pub nonce: [u8; 32],
     /// Cloud provider that issued the attestation
     pub provider: CloudProvider,
-    /// PCR values from the attestation (index -> hex-encoded digest)
-    pub pcrs: BTreeMap<u8, String>,
-    /// SHA-256 hash of the root CA's public key
-    pub root_pubkey_hash: String,
+    /// PCR values from the attestation: (algorithm_id, pcr_index) -> raw digest bytes
+    /// Algorithm IDs: 0 = SHA-256, 1 = SHA-384
+    pub pcrs: BTreeMap<(u8, u8), Vec<u8>>,
+    /// Timestamp when verification was performed (seconds since Unix epoch)
+    pub verified_at: u64,
 }
 
 /// Verify an entire AttestationOutput
@@ -170,7 +256,6 @@ pub struct VerificationResult {
 /// - `provider`: Cloud provider (AWS/GCP) if root CA is recognized
 /// - `pcrs`: PCR values from the attestation
 /// - `root_pubkey_hash`: SHA-256 of the trust anchor's public key
-/// - `method`: How verification was performed
 ///
 /// # Errors
 /// Returns `NoValidAttestation` if no supported verification path is available.
@@ -178,167 +263,11 @@ pub fn verify_attestation_output(
     output: &AttestationOutput,
     time: UnixTime,
 ) -> Result<VerificationResult, VerifyError> {
-    // Must have at least one TPM attestation
-    if output.attestation.tpm.is_empty() {
-        return Err(VerifyError::NoValidAttestation(
-            "no TPM attestations present".into(),
-        ));
-    }
+    // Decode to binary format (all hex/PEM parsing happens here)
+    let decoded = DecodedAttestationOutput::decode(output)?;
 
-    // Try GCP verification path (certificate-based trust)
-    if let Some(ref gcp_data) = output.attestation.gcp {
-        return gcp::verify_gcp_attestation(output, gcp_data, time);
-    }
-
-    // Try Nitro verification path (Nitro NSM document-based trust)
-    if let Some(ref nitro) = output.attestation.nitro {
-        return verify_nitro_quote_attestation(output, nitro, time);
-    }
-
-    // No supported attestation method found
-    Err(VerifyError::NoValidAttestation(
-        "No GCP or Nitro attestation present. \
-         Supported verification paths: AWS Nitro, GCP Shielded VM."
-            .into(),
-    ))
-}
-
-/// Verify Nitro attestation path using TPM2_Quote
-///
-/// This verification path:
-/// 1. Parses TPM2_Quote attestation to extract PCR digest and nonce
-/// 2. Verifies Quote signature with AK public key
-/// 3. Verifies Nitro NSM document binds the AK public key
-/// 4. Verifies PCRs match signed values in Nitro document
-fn verify_nitro_quote_attestation(
-    output: &AttestationOutput,
-    nitro: &NitroAttestationData,
-    time: UnixTime,
-) -> Result<VerificationResult, VerifyError> {
-    // Get the first (and typically only) TPM attestation
-    let (key_type, attestation) = output.attestation.tpm.iter().next().unwrap();
-
-    // Get the corresponding signing key (AK) public key
-    let ak_pk = output.ak_pubkeys.get(key_type).ok_or_else(|| {
-        VerifyError::NoValidAttestation(format!("{}: missing AK public key", key_type))
-    })?;
-
-    // Decode AK public key
-    let ak_x = hex::decode(&ak_pk.x)?;
-    let ak_y = hex::decode(&ak_pk.y)?;
-
-    // Parse TPM2_Quote attestation
-    let attest_data = hex::decode(&attestation.attest_data)?;
-    let quote_info = parse_quote_attest(&attest_data)?;
-
-    // Verify top-level nonce matches nonce in Quote (prevents tampering)
-    let nonce_from_field = hex::decode(&output.nonce)?;
-    if nonce_from_field != quote_info.nonce {
-        return Err(VerifyError::InvalidAttest(format!(
-            "Nonce field does not match nonce in Quote. \
-             Field: {}, Quote: {}",
-            output.nonce,
-            hex::encode(&quote_info.nonce)
-        )));
-    }
-
-    // Verify AK signature over TPM2_Quote
-    let signature = hex::decode(&attestation.signature)?;
-    let mut ak_pubkey = vec![0x04];
-    ak_pubkey.extend(&ak_x);
-    ak_pubkey.extend(&ak_y);
-    verify_ecdsa_p256(&attest_data, &signature, &ak_pubkey)?;
-
-    // Verify Nitro attestation (COSE signature, cert chain)
-    let nitro_result = verify_nitro_attestation(
-        &nitro.document,
-        None, // Nonce validation happens via TPM binding below
-        None, // Pubkey validation happens below
-        time,
-    )?;
-
-    // Extract signed values from Nitro document
-    let signed_pubkey = nitro_result.document.public_key.as_ref().ok_or_else(|| {
-        VerifyError::NoValidAttestation(
-            "Nitro document missing public_key field - cannot bind TPM signing key".into(),
-        )
-    })?;
-    let signed_nonce = nitro_result.document.nonce.as_ref().ok_or_else(|| {
-        VerifyError::NoValidAttestation(
-            "Nitro document missing nonce field - cannot verify freshness".into(),
-        )
-    })?;
-
-    // Verify the AK public key matches the signed public_key in NSM document
-    let ak_secg = format!("04{}{}", ak_pk.x, ak_pk.y);
-    if ak_secg != *signed_pubkey {
-        return Err(VerifyError::SignatureInvalid(format!(
-            "TPM signing key does not match Nitro public_key binding: {} != {}",
-            ak_secg, signed_pubkey
-        )));
-    }
-
-    // Verify TPM nonce matches Nitro nonce (proves attestations generated together)
-    let tpm_nonce_hex = hex::encode(&quote_info.nonce);
-    if tpm_nonce_hex != *signed_nonce {
-        return Err(VerifyError::SignatureInvalid(format!(
-            "TPM nonce does not match Nitro nonce - attestations not generated together: {} != {}",
-            tpm_nonce_hex, signed_nonce
-        )));
-    }
-
-    // Verify SHA-384 PCRs match signed values in Nitro document
-    // The Nitro document contains nitrotpm_pcrs which are signed by AWS hardware
-    let sha384_pcrs = output.pcrs.get("sha384").ok_or_else(|| {
-        VerifyError::InvalidAttest("Missing SHA-384 PCRs - required for Nitro attestation".into())
-    })?;
-
-    let signed_pcrs = &nitro_result.document.pcrs;
-    if signed_pcrs.is_empty() {
-        return Err(VerifyError::InvalidAttest(
-            "Nitro document contains no signed PCRs".into(),
-        ));
-    }
-
-    // All signed PCRs must be present and match
-    for (idx, signed_value) in signed_pcrs.iter() {
-        match sha384_pcrs.get(idx) {
-            Some(claimed_value) if claimed_value == signed_value => {
-                // Match - good
-            }
-            Some(claimed_value) => {
-                return Err(VerifyError::SignatureInvalid(format!(
-                    "PCR {} SHA-384 mismatch: claimed {} != signed {}",
-                    idx, claimed_value, signed_value
-                )));
-            }
-            None => {
-                return Err(VerifyError::SignatureInvalid(format!(
-                    "PCR {} in signed Nitro document but missing from attestation",
-                    idx
-                )));
-            }
-        }
-    }
-
-    // Verify root is the known AWS Nitro root - fail if not recognized
-    let provider = roots::provider_from_hash(&nitro_result.root_pubkey_hash).ok_or_else(|| {
-        VerifyError::ChainValidation(format!(
-            "Unknown root CA: {}. Only known cloud provider roots are trusted.",
-            nitro_result.root_pubkey_hash
-        ))
-    })?;
-
-    // Collect PCRs from the attestation (use SHA-384 for Nitro)
-    let pcrs = output.pcrs.get("sha384").cloned().unwrap_or_default();
-
-    // Nonce is from TPM2_Quote.extraData
-    Ok(VerificationResult {
-        nonce: hex::encode(&quote_info.nonce),
-        provider,
-        pcrs,
-        root_pubkey_hash: nitro_result.root_pubkey_hash,
-    })
+    // Delegate to single verification path
+    verify_decoded_attestation_output(&decoded, time)
 }
 
 /// Convenience function to verify attestation from JSON string
@@ -382,12 +311,8 @@ mod tests {
         // Should be AWS (Nitro)
         assert_eq!(result.provider, CloudProvider::Aws);
 
-        // Nonce is now from TPM2B_ATTEST.extraData, not the raw attest_data field
-        assert!(!result.nonce.is_empty());
-
-        // Should have a root pubkey hash (AWS Nitro root)
-        assert!(!result.root_pubkey_hash.is_empty());
-        assert_eq!(result.root_pubkey_hash.len(), 64); // SHA-256 = 32 bytes = 64 hex chars
+        // Nonce should be 32 bytes
+        assert_eq!(result.nonce.len(), 32);
     }
 
     #[test]
@@ -402,25 +327,20 @@ mod tests {
         // Should be GCP
         assert_eq!(result.provider, CloudProvider::Gcp);
 
-        // Should have the nonce from the Quote
-        assert!(!result.nonce.is_empty());
-        assert_eq!(
-            result.nonce,
-            "8a543108a653b4a1162232744cc9b945017a449dea4fbb0ca62f42d3ef145562"
-        );
+        // Should have the nonce from the Quote (binary)
+        let expected_nonce =
+            hex::decode("8a543108a653b4a1162232744cc9b945017a449dea4fbb0ca62f42d3ef145562")
+                .unwrap();
+        assert_eq!(result.nonce.as_slice(), expected_nonce.as_slice());
 
         // Should have PCR values
         assert!(!result.pcrs.is_empty());
-
-        // Should have GCP root pubkey hash
-        assert!(!result.root_pubkey_hash.is_empty());
-        assert_eq!(result.root_pubkey_hash.len(), 64);
     }
 
     #[test]
     fn test_reject_empty_attestation() {
         let output = AttestationOutput {
-            nonce: "deadbeef".to_string(),
+            nonce: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
             pcrs: std::collections::HashMap::new(),
             ak_pubkeys: std::collections::HashMap::new(),
             attestation: AttestationContainer {
@@ -430,8 +350,12 @@ mod tests {
             },
         };
 
+        // With the new architecture, decode() fails first when there's no AK pubkey
         let result = verify_attestation_output(&output, UnixTime::now());
-        assert!(matches!(result, Err(VerifyError::NoValidAttestation(_))));
+        assert!(
+            result.is_err(),
+            "Should reject attestation with missing components"
+        );
     }
 
     /// Test that tampering with the AK public key field is detected
@@ -527,16 +451,13 @@ mod tdx_tests {
         // Should be GCP
         assert_eq!(result.provider, CloudProvider::Gcp);
 
-        // Should have the nonce from the Quote
-        assert_eq!(
-            result.nonce,
-            "6424632e79ec068f2189adf46d121b9a10f758c45a18c52f630da14600d4317b"
-        );
+        // Should have the nonce from the Quote (binary)
+        let expected_nonce =
+            hex::decode("6424632e79ec068f2189adf46d121b9a10f758c45a18c52f630da14600d4317b")
+                .unwrap();
+        assert_eq!(result.nonce.as_slice(), expected_nonce.as_slice());
 
         // Should have PCR values
         assert!(!result.pcrs.is_empty());
-
-        // Root pubkey hash should match the known GCP root (same as AMD)
-        assert_eq!(result.root_pubkey_hash.len(), 64);
     }
 }

@@ -267,17 +267,16 @@ pub fn extract_public_key(cert: &Certificate) -> Result<Vec<u8>, VerifyError> {
     Ok(pubkey_bits.to_vec())
 }
 
-/// Compute SHA-256 hash of public key and return as hex string
-pub fn hash_public_key(pubkey_bytes: &[u8]) -> String {
-    let digest = Sha256::digest(pubkey_bytes);
-    hex::encode(digest)
+/// Compute SHA-256 hash of public key
+pub fn hash_public_key(pubkey_bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(pubkey_bytes).into()
 }
 
 /// Result of certificate chain validation
 #[derive(Debug)]
 pub struct ChainValidationResult {
-    /// SHA-256 hash of the root CA's public key (hex string)
-    pub root_pubkey_hash: String,
+    /// SHA-256 hash of the root CA's public key
+    pub root_pubkey_hash: [u8; 32],
 }
 
 /// Validate certificate chain with rigid X.509 validation
@@ -574,8 +573,8 @@ mod tests {
     fn test_hash_public_key() {
         let pubkey = [0x04, 0x01, 0x02, 0x03];
         let hash = hash_public_key(&pubkey);
-        // SHA-256 of [0x04, 0x01, 0x02, 0x03]
-        assert_eq!(hash.len(), 64); // 32 bytes = 64 hex chars
+        // SHA-256 returns 32 bytes
+        assert_eq!(hash.len(), 32);
     }
 
     #[test]

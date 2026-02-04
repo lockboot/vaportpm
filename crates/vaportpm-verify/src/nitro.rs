@@ -9,106 +9,79 @@ use coset::{CborSerializable, CoseSign1};
 use der::Decode;
 use ecdsa::signature::hazmat::PrehashVerifier;
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
-use serde::Serialize;
 use sha2::{Digest, Sha384};
 use x509_cert::Certificate;
 
 use pki_types::UnixTime;
 
 use crate::error::VerifyError;
+use crate::tpm::{parse_quote_attest, verify_ecdsa_p256};
 use crate::x509::{extract_public_key, validate_tpm_cert_chain};
+use crate::{roots, DecodedAttestationOutput, VerificationResult};
 
-/// Result of successful Nitro attestation verification
-///
-/// This struct is only returned when verification succeeds.
-/// If signature or chain validation fails, an error is returned instead.
-#[derive(Debug, Serialize)]
-pub struct NitroVerifyResult {
-    /// Parsed attestation document fields
-    pub document: NitroDocument,
-    /// SHA-256 hash of the root CA's public key (hex string)
-    pub root_pubkey_hash: String,
-}
-
-/// Parsed Nitro attestation document
-#[derive(Debug, Serialize, Clone)]
-pub struct NitroDocument {
-    /// Module ID
-    pub module_id: String,
-    /// Timestamp (milliseconds since epoch)
-    pub timestamp: u64,
-    /// TPM PCR values from Nitro document's `nitrotpm_pcrs` field (index -> hex SHA-384 digest)
+/// Parsed Nitro attestation document (internal)
+#[derive(Debug, Clone)]
+struct NitroDocument {
+    /// TPM PCR values from Nitro document's `nitrotpm_pcrs` field (index -> SHA-384 digest)
     /// These are the PCR values signed by AWS hardware.
-    pub pcrs: BTreeMap<u8, String>,
-    /// Public key (hex-encoded, if provided)
-    pub public_key: Option<String>,
-    /// User data (hex-encoded, if provided)
-    pub user_data: Option<String>,
-    /// Nonce (hex-encoded, if provided)
-    pub nonce: Option<String>,
-    /// Digest algorithm used
-    pub digest: String,
+    pub pcrs: BTreeMap<u8, Vec<u8>>,
+    /// Public key (raw bytes, if provided)
+    pub public_key: Option<Vec<u8>>,
+    /// Nonce (raw bytes, if provided)
+    pub nonce: Option<Vec<u8>>,
 }
 
-/// Verify Nitro attestation document
+/// Verify Nitro TPM attestation with pre-decoded data
 ///
-/// # Arguments
-/// * `document_hex` - CBOR-encoded COSE Sign1 attestation document as hex string
-/// * `expected_nonce` - Expected nonce value (optional validation)
-/// * `expected_pubkey_hex` - Expected public key in SECG format (optional validation)
-/// * `time` - Time to use for certificate validation (use `UnixTime::now()` for production)
+/// This verification path:
+/// 1. Parses TPM2_Quote attestation to extract PCR digest and nonce
+/// 2. Verifies Quote signature with AK public key
+/// 3. Verifies Nitro NSM document binds the AK public key
+/// 4. Verifies PCRs match signed values in Nitro document
 ///
-/// # Returns
-/// Verification result with parsed document and root public key hash
-pub fn verify_nitro_attestation(
-    document_hex: &str,
-    expected_nonce: Option<&[u8]>,
-    expected_pubkey_hex: Option<&str>,
+/// All inputs should be pre-decoded binary data (raw COSE document bytes).
+pub fn verify_nitro_decoded(
+    decoded: &DecodedAttestationOutput,
+    document_bytes: &[u8],
     time: UnixTime,
-) -> Result<NitroVerifyResult, VerifyError> {
-    // Decode hex input
-    let document_bytes = hex::decode(document_hex)?;
+) -> Result<VerificationResult, VerifyError> {
+    // Parse TPM2_Quote attestation
+    let quote_info = parse_quote_attest(&decoded.quote_attest)?;
 
-    // Parse the COSE Sign1 structure (NSM returns untagged COSE)
-    let cose_sign1 = CoseSign1::from_slice(&document_bytes)
+    // Verify nonce matches Quote
+    if decoded.nonce != quote_info.nonce.as_slice() {
+        return Err(VerifyError::InvalidAttest(format!(
+            "Nonce does not match Quote. Expected: {}, Quote: {}",
+            hex::encode(decoded.nonce),
+            hex::encode(&quote_info.nonce)
+        )));
+    }
+
+    // Verify AK signature over TPM2_Quote
+    verify_ecdsa_p256(
+        &decoded.quote_attest,
+        &decoded.quote_signature,
+        &decoded.ak_pubkey,
+    )?;
+
+    // Parse and verify Nitro document (COSE signature, cert chain)
+    let cose_sign1 = CoseSign1::from_slice(document_bytes)
         .map_err(|e| VerifyError::CoseVerify(format!("Failed to parse COSE Sign1: {}", e)))?;
 
-    // Extract the payload
     let payload = cose_sign1
         .payload
         .as_ref()
         .ok_or_else(|| VerifyError::CoseVerify("Missing payload".into()))?;
 
-    // Parse payload as CBOR
     let doc_value: CborValue = ciborium::from_reader(payload.as_slice())
         .map_err(|e| VerifyError::CborParse(format!("Failed to parse payload: {}", e)))?;
 
-    // Extract document fields
     let doc_map = match &doc_value {
         CborValue::Map(m) => m,
         _ => return Err(VerifyError::CborParse("Payload is not a map".into())),
     };
 
     let nitro_doc = parse_nitro_document(doc_map)?;
-
-    // Validate nonce if provided
-    if let Some(expected) = expected_nonce {
-        if let Some(ref nonce_hex) = nitro_doc.nonce {
-            let nonce_bytes = hex::decode(nonce_hex)?;
-            if nonce_bytes != expected {
-                return Err(VerifyError::CoseVerify("Nonce mismatch".into()));
-            }
-        }
-    }
-
-    // Validate public key if provided
-    if let Some(expected_pk) = expected_pubkey_hex {
-        if let Some(ref pk) = nitro_doc.public_key {
-            if pk != expected_pk {
-                return Err(VerifyError::CoseVerify("Public key mismatch".into()));
-            }
-        }
-    }
 
     // Extract certificate and CA bundle
     let cert_der = extract_cbor_bytes(doc_map, "certificate")?;
@@ -119,7 +92,6 @@ pub fn verify_nitro_attestation(
         .map_err(|e| VerifyError::CertificateParse(format!("Invalid leaf cert: {}", e)))?;
 
     // Build chain in leaf-to-root order
-    // AWS cabundle is ordered [root, ..., issuer], so we reverse it
     let mut chain = vec![leaf_cert];
     for ca_der in cabundle.into_iter().rev() {
         let ca_cert = Certificate::from_der(&ca_der)
@@ -127,44 +99,127 @@ pub fn verify_nitro_attestation(
         chain.push(ca_cert);
     }
 
-    // Verify COSE signature using leaf certificate (fails on error)
-    // Do this before chain validation to fail fast on signature issues
+    // Verify COSE signature using leaf certificate
     let leaf_pubkey = extract_public_key(&chain[0])?;
     verify_cose_signature(&cose_sign1, &leaf_pubkey, payload)?;
 
     // Validate certificate chain
-    // This validates signatures, dates, extensions, and returns root's public key hash
     let chain_result = validate_tpm_cert_chain(&chain, time)?;
-    let root_pubkey_hash = chain_result.root_pubkey_hash;
 
-    Ok(NitroVerifyResult {
-        document: nitro_doc,
-        root_pubkey_hash,
+    // Extract signed values from Nitro document
+    let signed_pubkey = nitro_doc.public_key.as_ref().ok_or_else(|| {
+        VerifyError::NoValidAttestation(
+            "Nitro document missing public_key field - cannot bind TPM signing key".into(),
+        )
+    })?;
+    let signed_nonce = nitro_doc.nonce.as_ref().ok_or_else(|| {
+        VerifyError::NoValidAttestation(
+            "Nitro document missing nonce field - cannot verify freshness".into(),
+        )
+    })?;
+
+    // Verify the AK public key matches the signed public_key in NSM document (binary comparison)
+    if decoded.ak_pubkey.as_slice() != signed_pubkey.as_slice() {
+        return Err(VerifyError::SignatureInvalid(format!(
+            "TPM signing key does not match Nitro public_key binding: {} != {}",
+            hex::encode(decoded.ak_pubkey),
+            hex::encode(signed_pubkey)
+        )));
+    }
+
+    // Verify TPM nonce matches Nitro nonce (binary comparison)
+    if quote_info.nonce.as_slice() != signed_nonce.as_slice() {
+        return Err(VerifyError::SignatureInvalid(format!(
+            "TPM nonce does not match Nitro nonce: {} != {}",
+            hex::encode(&quote_info.nonce),
+            hex::encode(signed_nonce)
+        )));
+    }
+
+    // Verify we have SHA-384 PCRs (algorithm ID 1)
+    let has_sha384_pcrs = decoded.pcrs.keys().any(|(alg_id, _)| *alg_id == 1);
+    if !has_sha384_pcrs {
+        return Err(VerifyError::InvalidAttest(
+            "Missing SHA-384 PCRs - required for Nitro attestation".into(),
+        ));
+    }
+
+    let signed_pcrs = &nitro_doc.pcrs;
+    if signed_pcrs.is_empty() {
+        return Err(VerifyError::InvalidAttest(
+            "Nitro document contains no signed PCRs".into(),
+        ));
+    }
+
+    // All signed PCRs must be present and match (binary comparison)
+    // Look up in decoded.pcrs using (algorithm_id=1 for SHA-384, pcr_index)
+    for (idx, signed_value) in signed_pcrs.iter() {
+        match decoded.pcrs.get(&(1, *idx)) {
+            Some(claimed_value) if claimed_value == signed_value => {
+                // Match - good
+            }
+            Some(claimed_value) => {
+                return Err(VerifyError::SignatureInvalid(format!(
+                    "PCR {} SHA-384 mismatch: claimed {} != signed {}",
+                    idx,
+                    hex::encode(claimed_value),
+                    hex::encode(signed_value)
+                )));
+            }
+            None => {
+                return Err(VerifyError::SignatureInvalid(format!(
+                    "PCR {} in signed Nitro document but missing from attestation",
+                    idx
+                )));
+            }
+        }
+    }
+
+    // Verify root is known
+    let provider = roots::provider_from_hash(&chain_result.root_pubkey_hash).ok_or_else(|| {
+        VerifyError::ChainValidation(format!(
+            "Unknown root CA: {}. Only known cloud provider roots are trusted.",
+            hex::encode(chain_result.root_pubkey_hash)
+        ))
+    })?;
+
+    // Convert nonce to fixed-size array
+    let nonce: [u8; 32] = quote_info
+        .nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::InvalidAttest("nonce is not 32 bytes".into()))?;
+
+    Ok(VerificationResult {
+        nonce,
+        provider,
+        pcrs: decoded.pcrs.clone(),
+        verified_at: time.as_secs(),
     })
 }
 
 /// Parse Nitro document fields from CBOR map
 fn parse_nitro_document(map: &[(CborValue, CborValue)]) -> Result<NitroDocument, VerifyError> {
-    let module_id = extract_cbor_text(map, "module_id")?;
-    let timestamp = extract_cbor_integer(map, "timestamp")?;
+    // Verify digest algorithm is SHA384 as expected
     let digest = extract_cbor_text(map, "digest")?;
+    if digest != "SHA384" {
+        return Err(VerifyError::InvalidAttest(format!(
+            "Unexpected Nitro digest algorithm: expected SHA384, got {}",
+            digest
+        )));
+    }
 
-    // Parse PCRs
+    // Parse PCRs (binary)
     let pcrs = extract_cbor_pcrs(map)?;
 
-    // Optional fields
-    let public_key = extract_cbor_bytes_optional(map, "public_key").map(|b| hex::encode(&b));
-    let user_data = extract_cbor_bytes_optional(map, "user_data").map(|b| hex::encode(&b));
-    let nonce = extract_cbor_bytes_optional(map, "nonce").map(|b| hex::encode(&b));
+    // Optional fields (binary)
+    let public_key = extract_cbor_bytes_optional(map, "public_key");
+    let nonce = extract_cbor_bytes_optional(map, "nonce");
 
     Ok(NitroDocument {
-        module_id,
-        timestamp,
         pcrs,
         public_key,
-        user_data,
         nonce,
-        digest,
     })
 }
 
@@ -175,34 +230,6 @@ fn extract_cbor_text(map: &[(CborValue, CborValue)], key: &str) -> Result<String
             if k_text == key {
                 if let CborValue::Text(val) = v {
                     return Ok(val.clone());
-                }
-            }
-        }
-    }
-    Err(VerifyError::CborParse(format!("Missing field: {}", key)))
-}
-
-/// Extract integer field from CBOR map
-fn extract_cbor_integer(map: &[(CborValue, CborValue)], key: &str) -> Result<u64, VerifyError> {
-    for (k, v) in map {
-        if let CborValue::Text(k_text) = k {
-            if k_text == key {
-                if let CborValue::Integer(val) = v {
-                    let val_i128: i128 = (*val).into();
-                    // Validate range before casting
-                    if val_i128 < 0 {
-                        return Err(VerifyError::CborParse(format!(
-                            "Field {} has negative value: {}",
-                            key, val_i128
-                        )));
-                    }
-                    if val_i128 > u64::MAX as i128 {
-                        return Err(VerifyError::CborParse(format!(
-                            "Field {} exceeds u64 range: {}",
-                            key, val_i128
-                        )));
-                    }
-                    return Ok(val_i128 as u64);
                 }
             }
         }
@@ -272,7 +299,7 @@ const MAX_TPM_PCR_INDEX: u8 = 23;
 
 /// Extract PCRs from CBOR map
 /// Handles both "pcrs" (Nitro Enclave) and "nitrotpm_pcrs" (Nitro TPM) field names
-fn extract_cbor_pcrs(map: &[(CborValue, CborValue)]) -> Result<BTreeMap<u8, String>, VerifyError> {
+fn extract_cbor_pcrs(map: &[(CborValue, CborValue)]) -> Result<BTreeMap<u8, Vec<u8>>, VerifyError> {
     for (k, v) in map {
         if let CborValue::Text(k_text) = k {
             // Check for both field names: "pcrs" (enclave) and "nitrotpm_pcrs" (TPM)
@@ -306,7 +333,7 @@ fn extract_cbor_pcrs(map: &[(CborValue, CborValue)]) -> Result<BTreeMap<u8, Stri
                                     )));
                                 }
 
-                                pcrs.insert(idx_i128 as u8, hex::encode(val));
+                                pcrs.insert(idx_i128 as u8, val.clone());
                             }
                         }
                     }
@@ -447,21 +474,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_cbor_integer_valid() {
-        let map = make_test_map();
-        let result = extract_cbor_integer(&map, "timestamp");
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 1234567890);
-    }
-
-    #[test]
-    fn test_extract_cbor_integer_missing() {
-        let map = make_test_map();
-        let result = extract_cbor_integer(&map, "nonexistent");
-        assert!(matches!(result, Err(VerifyError::CborParse(_))));
-    }
-
-    #[test]
     fn test_extract_cbor_bytes_valid() {
         let map = make_test_map();
         let result = extract_cbor_bytes(&map, "certificate");
@@ -516,57 +528,6 @@ mod tests {
         let map: Vec<(CborValue, CborValue)> = vec![];
         let result = extract_cbor_pcrs(&map);
         assert!(matches!(result, Err(VerifyError::CborParse(_))));
-    }
-
-    // === verify_nitro_attestation Input Validation Tests ===
-
-    // These tests fail before certificate validation, so time doesn't matter
-    fn dummy_time() -> UnixTime {
-        UnixTime::since_unix_epoch(std::time::Duration::from_secs(0))
-    }
-
-    #[test]
-    fn test_reject_invalid_hex() {
-        let result = verify_nitro_attestation("not valid hex!!!", None, None, dummy_time());
-        assert!(matches!(result, Err(VerifyError::HexDecode(_))));
-    }
-
-    #[test]
-    fn test_reject_empty_document() {
-        let result = verify_nitro_attestation("", None, None, dummy_time());
-        // Empty string decodes to empty bytes, which fails COSE parsing
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_reject_truncated_cbor() {
-        // Valid hex but truncated CBOR
-        let result = verify_nitro_attestation("d28443", None, None, dummy_time());
-        assert!(matches!(result, Err(VerifyError::CoseVerify(_))));
-    }
-
-    #[test]
-    fn test_reject_non_cose_cbor() {
-        // Valid CBOR but not a COSE Sign1 (just an integer)
-        let mut buf = Vec::new();
-        ciborium::into_writer(&CborValue::Integer(42.into()), &mut buf).unwrap();
-        let hex_str = hex::encode(&buf);
-
-        let result = verify_nitro_attestation(&hex_str, None, None, dummy_time());
-        assert!(matches!(result, Err(VerifyError::CoseVerify(_))));
-    }
-
-    #[test]
-    fn test_reject_wrong_cose_tag() {
-        // CBOR with a different tag (not COSE Sign1's 18)
-        let buf = vec![
-            0xd8, 0x63, // Tag 99 (not 18)
-            0x80, // Empty array
-        ];
-        let hex_str = hex::encode(&buf);
-
-        let result = verify_nitro_attestation(&hex_str, None, None, dummy_time());
-        assert!(matches!(result, Err(VerifyError::CoseVerify(_))));
     }
 
     // === Signature Length Validation ===
@@ -679,42 +640,5 @@ mod tests {
         )];
         let result = extract_cbor_pcrs(&map);
         assert!(matches!(result, Err(VerifyError::PcrIndexOutOfBounds(_))));
-    }
-
-    // === Malicious Integer Tests ===
-
-    #[test]
-    fn test_reject_negative_timestamp() {
-        let map = vec![(
-            CborValue::Text("timestamp".to_string()),
-            CborValue::Integer((-1i64).into()),
-        )];
-        let result = extract_cbor_integer(&map, "timestamp");
-        assert!(
-            matches!(result, Err(VerifyError::CborParse(_))),
-            "Should reject negative timestamp, got: {:?}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_accept_valid_timestamp() {
-        let map = vec![(
-            CborValue::Text("timestamp".to_string()),
-            CborValue::Integer(1234567890i64.into()),
-        )];
-        let result = extract_cbor_integer(&map, "timestamp");
-        assert_eq!(result.unwrap(), 1234567890);
-    }
-
-    #[test]
-    fn test_accept_max_i64_timestamp() {
-        // i64::MAX is valid and fits in u64
-        let map = vec![(
-            CborValue::Text("timestamp".to_string()),
-            CborValue::Integer(i64::MAX.into()),
-        )];
-        let result = extract_cbor_integer(&map, "timestamp");
-        assert_eq!(result.unwrap(), i64::MAX as u64);
     }
 }

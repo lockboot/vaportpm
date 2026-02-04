@@ -4,15 +4,15 @@
 
 use std::collections::BTreeMap;
 
+use der::Decode;
 use pki_types::UnixTime;
 use sha2::{Digest, Sha256};
+use x509_cert::Certificate;
 
 use crate::error::VerifyError;
 use crate::tpm::{parse_quote_attest, verify_ecdsa_p256, TpmQuoteInfo};
-use crate::x509::{extract_public_key, parse_cert_chain_pem, validate_tpm_cert_chain};
-use crate::{roots, VerificationResult};
-
-use vaportpm_attest::a9n::{AttestationOutput, GcpAttestationData};
+use crate::x509::{extract_public_key, validate_tpm_cert_chain};
+use crate::{roots, DecodedAttestationOutput, VerificationResult};
 
 /// Verify GCP Shielded VM attestation
 ///
@@ -21,77 +21,100 @@ use vaportpm_attest::a9n::{AttestationOutput, GcpAttestationData};
 /// 2. Validates AK certificate chain to Google's root CA
 /// 3. Verifies Quote signature with AK public key from certificate
 /// 4. Verifies PCR digest matches claimed PCR values
-pub fn verify_gcp_attestation(
-    output: &AttestationOutput,
-    gcp: &GcpAttestationData,
+///
+/// All inputs should be pre-decoded binary data (DER certs, raw bytes).
+pub fn verify_gcp_decoded(
+    decoded: &DecodedAttestationOutput,
+    cert_chain_der: &[Vec<u8>],
     time: UnixTime,
 ) -> Result<VerificationResult, VerifyError> {
-    // Get TPM attestation (contains Quote data and signature)
-    let (_, tpm_attestation) = output
-        .attestation
-        .tpm
+    // Parse DER → Certificate (still needed for chain validation)
+    let certs: Vec<Certificate> = cert_chain_der
         .iter()
-        .next()
-        .ok_or_else(|| VerifyError::NoValidAttestation("Missing TPM attestation".into()))?;
+        .map(|der| {
+            Certificate::from_der(der)
+                .map_err(|e| VerifyError::CertificateParse(format!("Invalid DER cert: {}", e)))
+        })
+        .collect::<Result<_, _>>()?;
 
-    // Parse TPM2_Quote attestation (type = QUOTE, not CERTIFY)
-    let quote_data = hex::decode(&tpm_attestation.attest_data)?;
-    let quote_info = parse_quote_attest(&quote_data)?;
+    if certs.is_empty() {
+        return Err(VerifyError::ChainValidation(
+            "Empty certificate chain".into(),
+        ));
+    }
 
-    // Verify top-level nonce matches nonce in Quote (prevents tampering)
-    let nonce_from_field = hex::decode(&output.nonce)?;
-    if nonce_from_field != quote_info.nonce {
+    // Parse TPM2_Quote attestation
+    let quote_info = parse_quote_attest(&decoded.quote_attest)?;
+
+    // Verify nonce matches Quote
+    if decoded.nonce != quote_info.nonce.as_slice() {
         return Err(VerifyError::InvalidAttest(format!(
-            "Nonce field does not match nonce in Quote. \
-             Field: {}, Quote: {}",
-            output.nonce,
+            "Nonce does not match Quote. Expected: {}, Quote: {}",
+            hex::encode(decoded.nonce),
             hex::encode(&quote_info.nonce)
         )));
     }
 
     // Validate AK certificate chain to GCP root
-    let chain_result = validate_tpm_cert_chain(&parse_cert_chain_pem(&gcp.ak_cert_chain)?, time)?;
+    let chain_result = validate_tpm_cert_chain(&certs, time)?;
 
-    // Extract AK public key from leaf certificate
-    let certs = parse_cert_chain_pem(&gcp.ak_cert_chain)?;
-    let ak_pubkey = extract_public_key(&certs[0])?;
+    // Extract AK public key from leaf certificate for comparison
+    let ak_pubkey_from_cert = extract_public_key(&certs[0])?;
 
-    // Verify Quote signature with AK public key from certificate
-    let signature = hex::decode(&tpm_attestation.signature)?;
-    verify_ecdsa_p256(&quote_data, &signature, &ak_pubkey)?;
+    // Verify the AK public key matches the one in the decoded input
+    if ak_pubkey_from_cert != decoded.ak_pubkey {
+        return Err(VerifyError::SignatureInvalid(format!(
+            "AK public key mismatch: cert has {}, decoded has {}",
+            hex::encode(&ak_pubkey_from_cert),
+            hex::encode(decoded.ak_pubkey)
+        )));
+    }
 
-    // Verify PCR digest matches claimed PCR values
-    // The Quote contains a digest of the selected PCRs - this MUST be verified
-    let pcrs = output.pcrs.get("sha256").ok_or_else(|| {
-        VerifyError::InvalidAttest("Missing SHA-256 PCRs - required for GCP attestation".into())
-    })?;
-    if pcrs.is_empty() {
+    // Verify Quote signature with AK public key
+    verify_ecdsa_p256(
+        &decoded.quote_attest,
+        &decoded.quote_signature,
+        &decoded.ak_pubkey,
+    )?;
+
+    // Verify we have SHA-256 PCRs (algorithm ID 0)
+    let has_sha256_pcrs = decoded.pcrs.keys().any(|(alg_id, _)| *alg_id == 0);
+    if !has_sha256_pcrs {
         return Err(VerifyError::InvalidAttest(
-            "SHA-256 PCRs map is empty - at least one PCR required".into(),
+            "Missing SHA-256 PCRs - required for GCP attestation".into(),
         ));
     }
-    verify_pcr_digest_matches(&quote_info, pcrs)?;
 
-    // Verify root is a known GCP root - fail if not recognized
+    // Verify PCR digest matches claimed PCR values
+    verify_pcr_digest_matches(&quote_info, &decoded.pcrs)?;
+
+    // Verify root is a known GCP root
     let provider = roots::provider_from_hash(&chain_result.root_pubkey_hash).ok_or_else(|| {
         VerifyError::ChainValidation(format!(
             "Unknown root CA: {}. Only known cloud provider roots are trusted.",
-            chain_result.root_pubkey_hash
+            hex::encode(chain_result.root_pubkey_hash)
         ))
     })?;
 
+    // Convert nonce to fixed-size array
+    let nonce: [u8; 32] = quote_info
+        .nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::InvalidAttest("nonce is not 32 bytes".into()))?;
+
     Ok(VerificationResult {
-        nonce: hex::encode(&quote_info.nonce),
+        nonce,
         provider,
-        pcrs: pcrs.clone(),
-        root_pubkey_hash: chain_result.root_pubkey_hash,
+        pcrs: decoded.pcrs.clone(),
+        verified_at: time.as_secs(),
     })
 }
 
 /// Verify that the PCR digest in a Quote matches the claimed PCR values
 fn verify_pcr_digest_matches(
     quote_info: &TpmQuoteInfo,
-    pcrs: &BTreeMap<u8, String>,
+    pcrs: &BTreeMap<(u8, u8), Vec<u8>>,
 ) -> Result<(), VerifyError> {
     // The PCR digest is SHA-256(concatenation of selected PCR values in order)
     // The selection order is determined by the pcr_select field
@@ -111,14 +134,9 @@ fn verify_pcr_digest_matches(
             for bit_idx in 0..8 {
                 if byte_val & (1 << bit_idx) != 0 {
                     let pcr_idx = (byte_idx * 8 + bit_idx) as u8;
-                    if let Some(pcr_value_hex) = pcrs.get(&pcr_idx) {
-                        let pcr_value = hex::decode(pcr_value_hex).map_err(|e| {
-                            VerifyError::InvalidAttest(format!(
-                                "Invalid PCR {} hex value: {}",
-                                pcr_idx, e
-                            ))
-                        })?;
-                        hasher.update(&pcr_value);
+                    // Look up by (algorithm_id=0 for SHA-256, pcr_index)
+                    if let Some(pcr_value) = pcrs.get(&(0, pcr_idx)) {
+                        hasher.update(pcr_value);
                     } else {
                         return Err(VerifyError::InvalidAttest(format!(
                             "PCR {} selected in Quote but not present in attestation",

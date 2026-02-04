@@ -27,3 +27,4 @@ pki-types = { package = "rustls-pki-types", version = "1.13" }
 [dev-dependencies]
 # For integration tests
 hex-literal = "0.4"
+bincode = "1.3"

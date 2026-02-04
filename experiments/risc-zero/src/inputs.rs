@@ -20,8 +20,8 @@ pub struct ZkPublicInputs {
     pub nonce: [u8; 32],
     /// Cloud provider: 0 = AWS, 1 = GCP
     pub provider: u8,
-    /// SHA256 of root CA public key
-    pub root_pubkey_hash: [u8; 32],
+    /// Timestamp used for verification (seconds since Unix epoch)
+    pub verified_at: u64,
 }
 
 impl ZkPublicInputs {

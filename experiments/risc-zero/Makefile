@@ -11,7 +11,11 @@ test:
 
 # Cycle count specifically
 cycles:
-	RISC0_PPROF_OUT=./profile.pb cargo test cycle_count -- --nocapture && ~/go/bin/go tool pprof -text profile.pb
+	RISC0_PPROF_OUT=./profile.pb cargo test --release test_gcp_attestation_cycle_count -- --nocapture && ~/go/bin/go tool pprof -text profile.pb
+	#RISC0_PPROF_OUT=./profile.pb cargo test --release test_nitro_attestation_cycle_count -- --nocapture && ~/go/bin/go tool pprof -text profile.pb
+
+pprof-ui:
+	~/go/bin/go tool pprof -http 0.0.0.0:8090 profile.pb 
 
 clean:
 	cargo clean
