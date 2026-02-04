@@ -36,12 +36,12 @@ RISC0_DEV_MODE=1 cargo test -- --nocapture
 
 ```
 === GCP Attestation Verification ===
-Total cycles: 1993676
+Total cycles: 1998559
 Segments: 3
 
 === Nitro Attestation Verification ===
-Total cycles: 315958121
-Segments: 318
+Total cycles: 5027644
+Segments: 6
 ```
 
 ## Public Inputs
@@ -62,6 +62,7 @@ The ZK circuit commits the following public inputs:
 experiments/risc-zero/
 ├── Cargo.toml              # Host crate (standalone workspace)
 ├── Makefile                # Build/test commands
+├── rustcrypto-elliptic-curves/  # Git submodule (P-384 fork)
 ├── src/
 │   ├── lib.rs              # Library root
 │   ├── host.rs             # Host utilities
@@ -98,19 +99,33 @@ The guest uses RISC Zero's patched crypto crates for hardware-accelerated precom
 | Crate | Precompile | Notes |
 |-------|------------|-------|
 | `sha2` | SHA-256/SHA-384 | Used extensively in cert validation |
-| `p256` | P-256 ECDSA | GCP uses P-256 for signatures |
+| `p256` | P-256 ECDSA | GCP uses P-256 for AK signatures |
+| `p384` | P-384 ECDSA | Nitro uses P-384 for all signatures (via fork) |
 | `rsa` | RSA | GCP uses RSA-4096 certificates |
 | `crypto-bigint` | Modular arithmetic | Accelerates bigint operations |
 
-These patches are applied via `[patch.crates-io]` in the guest Cargo.toml.
+These patches are applied via `[patch.crates-io]` in the guest Cargo.toml. The P-384 acceleration requires the `elliptic-curves` submodule.
 
 ### P-384 Support (Nitro)
 
-AWS Nitro uses **P-384 ECDSA** for its certificate chain, which currently lacks a dedicated RISC Zero precompile. This explains the ~160x cycle difference between GCP (~2M) and Nitro (~316M).
+AWS Nitro uses **P-384 ECDSA** exclusively for its certificate chain. This experiment uses a patched version of `elliptic-curves` with P-384 acceleration via `risc0-bigint2`.
 
-The `risc0-bigint2` crate (v1.4.x) includes P-384 field support, suggesting the team is aware and working on it. The `k256` precompile uses `modmul_u256_denormalized` intrinsics, and `p256` uses `risc0_bigint2::field` - a similar approach for P-384 would dramatically reduce Nitro verification cycles.
+**Upstream PR:** https://github.com/risc0/RustCrypto-elliptic-curves/pull/15
 
-For reference, GCP verification with RSA-4096 (3 certificates) achieves ~2M cycles, demonstrating the effectiveness of the RSA precompile.
+The P-384 patch is included as a git submodule at `rustcrypto-elliptic-curves/`, tracking the `risc0-p256-p384-unified` branch from the fork.
+
+#### Why Nitro is ~2.5x slower than GCP
+
+Nitro attestation requires **5 P-384 ECDSA verifications**:
+- 1 COSE signature verification (attestation document)
+- 4 certificate chain verifications (leaf → instance → zonal → regional → root)
+
+Each P-384 verification costs ~400-500k cycles. The breakdown from profiling:
+- P-384 EC scalar multiplication: ~30% of total cycles
+- SHA-512 (used by SHA-384): ~15% of total cycles
+- Bigint operations: ~29% of total cycles
+
+GCP uses RSA-4096 (which has a dedicated precompile) and P-256, requiring fewer expensive operations.
 
 ## Notes
 
@@ -119,4 +134,12 @@ For reference, GCP verification with RSA-4096 (3 certificates) achieves ~2M cycl
 - The main project is completely unchanged
 - Cycle counts give rough indication of proving cost
 - GCP verification is production-viable at ~2M cycles
-- Nitro verification awaits P-384 precompile support for practical use
+- Nitro verification is viable at ~5M cycles with P-384 acceleration (pending upstream merge)
+
+## Dependencies
+
+This experiment requires the P-384 accelerated elliptic-curves fork. After cloning, initialize the submodule:
+
+```bash
+git submodule update --init --recursive
+```
