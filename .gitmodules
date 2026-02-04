@@ -1,0 +1,4 @@
+[submodule "experiments/risc-zero/rustcrypto-elliptic-curves"]
+	path = experiments/risc-zero/rustcrypto-elliptic-curves
+	url = https://github.com/HarryR/RustCrypto-elliptic-curves.git
+	branch = risc0-p256-p384-unified

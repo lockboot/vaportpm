@@ -16,3 +16,4 @@ Cargo.lock
 .bash_history
 .risc0
 .bashrc
+/go
