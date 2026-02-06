@@ -6,12 +6,11 @@ use ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use sha2::{Digest, Sha256};
 
-use std::collections::BTreeMap;
-
 use crate::error::{InvalidAttestReason, SignatureInvalidReason, VerifyError};
+use crate::pcr::PcrBank;
 
 /// Verify ECDSA-SHA256 signature over a message
-pub fn verify_ecdsa_p256(
+pub(crate) fn verify_ecdsa_p256(
     message: &[u8],
     signature_der: &[u8],
     public_key: &[u8],
@@ -49,10 +48,11 @@ const TPMS_CLOCK_INFO_SIZE: usize = 17;
 
 /// Parsed TPMS_ATTEST structure (from TPM2_Quote)
 #[derive(Debug)]
-pub struct TpmQuoteInfo {
+pub(crate) struct TpmQuoteInfo {
     /// Nonce/qualifying data from extraData field (raw bytes)
     pub nonce: Vec<u8>,
-    /// Name of the signing key
+    /// Name of the signing key (parsed to advance cursor; not used for verification)
+    #[allow(dead_code)]
     pub signer_name: Vec<u8>,
     /// PCR selection (algorithm, PCR indices as bitmap)
     pub pcr_select: Vec<(u16, Vec<u8>)>,
@@ -71,7 +71,7 @@ pub struct TpmQuoteInfo {
 /// - firmwareVersion: u64
 /// - attested.quote.pcrSelect: TPML_PCR_SELECTION (PCRs that were quoted)
 /// - attested.quote.pcrDigest: TPM2B_DIGEST (hash of PCR values)
-pub fn parse_quote_attest(data: &[u8]) -> Result<TpmQuoteInfo, VerifyError> {
+pub(crate) fn parse_quote_attest(data: &[u8]) -> Result<TpmQuoteInfo, VerifyError> {
     let mut cursor = SafeCursor::new(data);
 
     // magic (4 bytes)
@@ -240,45 +240,15 @@ impl<'a> SafeCursor<'a> {
 
 /// Verify that the PCR digest in a Quote matches the claimed PCR values
 ///
-/// The TPM Quote contains a PCR selection (which banks/indices were quoted)
-/// and a digest over those PCR values. This function recomputes the digest
-/// from the claimed PCR values and compares it to the signed digest.
-///
-/// Supports multiple PCR banks:
-/// - TPM_ALG_SHA256 (0x000B) → decoded algorithm ID 0
-/// - TPM_ALG_SHA384 (0x000C) → decoded algorithm ID 1
-pub fn verify_pcr_digest_matches(
+/// The TPM Quote contains a PCR digest (SHA-256 of concatenated PCR values).
+/// PcrBank guarantees all 24 values in order, so we just hash them sequentially.
+pub(crate) fn verify_pcr_digest_matches(
     quote_info: &TpmQuoteInfo,
-    pcrs: &BTreeMap<(u8, u8), Vec<u8>>,
+    pcrs: &PcrBank,
 ) -> Result<(), VerifyError> {
-    // The PCR digest is SHA-256(concatenation of selected PCR values in order)
-    // The selection order is determined by the pcr_select field
     let mut hasher = Sha256::new();
-
-    for (alg, bitmap) in &quote_info.pcr_select {
-        let decoded_alg_id = match *alg {
-            0x000B => 0u8, // TPM_ALG_SHA256
-            0x000C => 1u8, // TPM_ALG_SHA384
-            _ => continue,
-        };
-
-        // Iterate through bitmap to find selected PCRs
-        for (byte_idx, byte_val) in bitmap.iter().enumerate() {
-            for bit_idx in 0..8 {
-                if byte_val & (1 << bit_idx) != 0 {
-                    let pcr_idx = (byte_idx * 8 + bit_idx) as u8;
-                    if let Some(pcr_value) = pcrs.get(&(decoded_alg_id, pcr_idx)) {
-                        hasher.update(pcr_value);
-                    } else {
-                        return Err(InvalidAttestReason::PcrSelectedButMissing {
-                            pcr_index: pcr_idx,
-                            algorithm: *alg,
-                        }
-                        .into());
-                    }
-                }
-            }
-        }
+    for value in pcrs.values() {
+        hasher.update(value);
     }
 
     let computed_digest = hasher.finalize();
@@ -287,6 +257,67 @@ pub fn verify_pcr_digest_matches(
     }
 
     Ok(())
+}
+
+/// Verify a TPM2_Quote: signature, PCR bank selection, nonce, and PCR digest.
+///
+/// This is the shared core of both GCP and Nitro verification. The only
+/// platform-specific input is `expected_alg` (Sha256 for GCP, Sha384 for Nitro).
+///
+/// After this returns successfully, the quote is fully authenticated and the
+/// PCR values in `decoded.pcrs` are proven to match the signed digest.
+pub(crate) fn verify_quote(
+    decoded: &crate::DecodedAttestationOutput,
+    expected_alg: crate::pcr::PcrAlgorithm,
+) -> Result<TpmQuoteInfo, VerifyError> {
+    let quote_info = parse_quote_attest(&decoded.quote_attest)?;
+
+    let ak_sec1 = decoded.ak_pubkey.to_sec1_uncompressed();
+    verify_ecdsa_p256(&decoded.quote_attest, &decoded.quote_signature, &ak_sec1)?;
+
+    // --- Quote is now authenticated; safe to trust its contents ---
+
+    // Enforce exactly one PCR bank with the expected algorithm, all 24 PCRs selected.
+    if quote_info.pcr_select.len() != 1 {
+        return Err(InvalidAttestReason::MultiplePcrBanks {
+            count: quote_info.pcr_select.len(),
+        }
+        .into());
+    }
+    let (quote_alg, quote_bitmap) = &quote_info.pcr_select[0];
+    if *quote_alg != expected_alg as u16 {
+        return Err(InvalidAttestReason::WrongPcrAlgorithm {
+            expected: expected_alg,
+            got: *quote_alg,
+        }
+        .into());
+    }
+    if quote_bitmap.len() < 3
+        || quote_bitmap[0] != 0xFF
+        || quote_bitmap[1] != 0xFF
+        || quote_bitmap[2] != 0xFF
+    {
+        return Err(InvalidAttestReason::PartialPcrBitmap.into());
+    }
+
+    // Verify PcrBank algorithm matches expected
+    if decoded.pcrs.algorithm() != expected_alg {
+        return Err(InvalidAttestReason::WrongPcrBankAlgorithm {
+            expected: expected_alg,
+            got: decoded.pcrs.algorithm(),
+        }
+        .into());
+    }
+
+    // Verify nonce matches Quote
+    if decoded.nonce != quote_info.nonce.as_slice() {
+        return Err(InvalidAttestReason::NonceMismatch.into());
+    }
+
+    // Verify PCR digest matches claimed PCR values
+    verify_pcr_digest_matches(&quote_info, &decoded.pcrs)?;
+
+    Ok(quote_info)
 }
 
 #[cfg(test)]

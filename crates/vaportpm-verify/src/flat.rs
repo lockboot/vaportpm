@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::error::InvalidAttestReason;
+use crate::pcr::{P256PublicKey, PcrBank};
 use crate::{DecodedAttestationOutput, DecodedPlatformAttestation, VerifyError};
 
 /// Platform type constants
@@ -54,13 +55,16 @@ pub fn to_bytes(decoded: &DecodedAttestationOutput) -> Vec<u8> {
         DecodedPlatformAttestation::Nitro { document } => document.clone(),
     };
 
+    let alg_u16 = decoded.pcrs.algorithm() as u16;
+    let digest_len = decoded.pcrs.algorithm().digest_len();
+
     let header = FlatHeader {
         nonce: decoded.nonce,
-        ak_pubkey: decoded.ak_pubkey,
+        ak_pubkey: decoded.ak_pubkey.to_sec1_uncompressed(),
         platform_type,
         quote_attest_len: decoded.quote_attest.len() as u16,
         quote_signature_len: decoded.quote_signature.len() as u16,
-        pcr_count: decoded.pcrs.len() as u8,
+        pcr_count: crate::pcr::PCR_COUNT as u8,
         platform_data_len: platform_data.len() as u16,
     };
 
@@ -69,11 +73,11 @@ pub fn to_bytes(decoded: &DecodedAttestationOutput) -> Vec<u8> {
     // Write header as bytes (zerocopy ensures correct layout)
     buf.extend_from_slice(header.as_bytes());
 
-    // Write PCRs: [alg_id, pcr_idx, len, value...]
-    for ((alg_id, pcr_idx), value) in &decoded.pcrs {
-        buf.push(*alg_id);
-        buf.push(*pcr_idx);
-        buf.push(value.len() as u8);
+    // Write PCRs: [alg_u16(2 bytes LE), pcr_idx, len, value...]
+    for (idx, value) in decoded.pcrs.values().enumerate() {
+        buf.extend_from_slice(&alg_u16.to_le_bytes());
+        buf.push(idx as u8);
+        buf.push(digest_len as u8);
         buf.extend_from_slice(value);
     }
 
@@ -108,24 +112,27 @@ pub fn from_bytes(data: &[u8]) -> Result<DecodedAttestationOutput, VerifyError> 
 
     let mut offset = HEADER_SIZE;
 
-    // Parse PCRs
+    // Parse PCRs: [alg_u16(2 bytes LE), pcr_idx, len, value...]
     let mut pcrs = BTreeMap::new();
     for _ in 0..pcr_count {
-        if offset + 3 > data.len() {
+        if offset + 4 > data.len() {
             return Err(InvalidAttestReason::FlatTruncated {
                 field: "PCR header",
             }
             .into());
         }
-        let alg_id = data[offset];
-        let pcr_idx = data[offset + 1];
-        let value_len = data[offset + 2] as usize;
-        offset += 3;
+        let alg_u16 = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
+        let pcr_idx = data[offset + 2];
+        let value_len = data[offset + 3] as usize;
+        offset += 4;
 
         if offset + value_len > data.len() {
             return Err(InvalidAttestReason::FlatTruncated { field: "PCR value" }.into());
         }
-        pcrs.insert((alg_id, pcr_idx), data[offset..offset + value_len].to_vec());
+        pcrs.insert(
+            (alg_u16, pcr_idx),
+            data[offset..offset + value_len].to_vec(),
+        );
         offset += value_len;
     }
 
@@ -205,10 +212,13 @@ pub fn from_bytes(data: &[u8]) -> Result<DecodedAttestationOutput, VerifyError> 
         }
     };
 
+    let pcr_bank = PcrBank::from_btree_map(&pcrs)?;
+    let ak_pubkey = P256PublicKey::from_sec1_uncompressed(&header.ak_pubkey)?;
+
     Ok(DecodedAttestationOutput {
         nonce: header.nonce,
-        pcrs,
-        ak_pubkey: header.ak_pubkey,
+        pcrs: pcr_bank,
+        ak_pubkey,
         quote_attest,
         quote_signature,
         platform,

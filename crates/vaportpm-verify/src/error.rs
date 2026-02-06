@@ -66,8 +66,11 @@ pub enum InvalidAttestReason {
     #[error("Requires exactly one PCR bank selection, got {count}")]
     MultiplePcrBanks { count: usize },
 
-    #[error("Requires TPM Quote to select PCR algorithm 0x{expected:04X}, got 0x{got:04X}")]
-    WrongPcrAlgorithm { expected: u16, got: u16 },
+    #[error("Requires TPM Quote to select {expected}, got algorithm 0x{got:04X}")]
+    WrongPcrAlgorithm {
+        expected: crate::pcr::PcrAlgorithm,
+        got: u16,
+    },
 
     #[error("Requires all 24 PCRs selected in Quote bitmap")]
     PartialPcrBitmap,
@@ -78,34 +81,43 @@ pub enum InvalidAttestReason {
     #[error("Nonce is not 32 bytes")]
     NonceLengthInvalid,
 
-    #[error("Missing SHA-256 PCRs - required for GCP attestation")]
-    MissingSha256Pcrs,
-
-    #[error("Missing SHA-384 PCRs - required for Nitro attestation")]
-    MissingSha384Pcrs,
-
-    #[error("Contains non-SHA-256 PCR (alg_id={alg_id}, pcr={pcr_idx}); only SHA-256 PCRs are verified in the GCP path")]
-    UnexpectedPcrAlgorithmGcp { alg_id: u8, pcr_idx: u8 },
-
-    #[error("Contains non-SHA-384 PCR (alg_id={alg_id}, pcr={pcr_idx}); only SHA-384 PCRs are verified in the Nitro path")]
-    UnexpectedPcrAlgorithmNitro { alg_id: u8, pcr_idx: u8 },
-
-    #[error("PCR index {index} out of range; only PCRs 0-23 are valid")]
-    PcrIndexOutOfRange { index: u8 },
-
     #[error("Missing PCR {index} - all 24 PCRs (0-23) are required")]
     MissingPcr { index: u8 },
+
+    // PCR bank validation (pcr.rs)
+    #[error("PCR bank is empty")]
+    PcrBankEmpty,
+
+    #[error("PCR bank contains mixed algorithms")]
+    PcrBankMixedAlgorithms,
+
+    #[error("PCR bank has {got} entries, expected {expected}")]
+    PcrBankWrongCount { expected: usize, got: usize },
+
+    #[error("PCR {index} value has wrong length: expected {expected}, got {got}")]
+    PcrValueWrongLength {
+        index: u8,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("Unknown PCR algorithm: 0x{alg_id:04X}")]
+    UnknownPcrAlgorithm { alg_id: u16 },
+
+    #[error("Wrong PCR bank algorithm: expected {expected}, got {got}")]
+    WrongPcrBankAlgorithm {
+        expected: crate::pcr::PcrAlgorithm,
+        got: crate::pcr::PcrAlgorithm,
+    },
+
+    #[error("Invalid AK public key format")]
+    InvalidAkPubkeyFormat,
 
     #[error("Nitro document contains no signed PCRs")]
     EmptySignedPcrs,
 
     #[error("PCR {pcr_index} in attestation but not signed by Nitro document")]
     PcrNotSigned { pcr_index: u8 },
-
-    #[error(
-        "PCR {pcr_index} (alg 0x{algorithm:04X}) selected in Quote but not present in attestation"
-    )]
-    PcrSelectedButMissing { pcr_index: u8, algorithm: u16 },
 
     #[error("PCR digest mismatch")]
     PcrDigestMismatch,
@@ -149,17 +161,11 @@ pub enum SignatureInvalidReason {
     #[error("AK public key mismatch between certificate and decoded input")]
     AkPublicKeyMismatch,
 
-    #[error("TPM signing key does not match Nitro public_key binding")]
-    AkNitroBindingMismatch,
-
     #[error("TPM nonce does not match Nitro nonce")]
     NitroNonceMismatch,
 
     #[error("PCR {index} SHA-384 mismatch between claimed and signed value")]
     PcrValueMismatch { index: u8 },
-
-    #[error("PCR {index} in signed Nitro document but missing from attestation")]
-    PcrMissingFromAttestation { index: u8 },
 }
 
 // =============================================================================
@@ -333,12 +339,6 @@ pub enum PcrIndexOutOfBoundsReason {
 
 #[derive(Debug, Error)]
 pub enum NoValidAttestationReason {
-    #[error("Nitro document missing public_key field - cannot bind TPM signing key")]
-    MissingPublicKey,
-
-    #[error("Nitro document missing nonce field - cannot verify freshness")]
-    MissingNonce,
-
     #[error("Missing ecc_p256 AK public key")]
     MissingAkPublicKey,
 

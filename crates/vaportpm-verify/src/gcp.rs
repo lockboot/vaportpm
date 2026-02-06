@@ -10,7 +10,8 @@ use crate::error::{
     CertificateParseReason, ChainValidationReason, InvalidAttestReason, SignatureInvalidReason,
     VerifyError,
 };
-use crate::tpm::{parse_quote_attest, verify_ecdsa_p256, verify_pcr_digest_matches};
+use crate::pcr::PcrAlgorithm;
+use crate::tpm::verify_quote;
 use crate::x509::{extract_public_key, validate_tpm_cert_chain};
 use crate::CloudProvider;
 use crate::{roots, DecodedAttestationOutput, VerificationResult};
@@ -69,95 +70,18 @@ pub fn verify_gcp_decoded(
     cert_chain_der: &[Vec<u8>],
     time: UnixTime,
 ) -> Result<VerificationResult, VerifyError> {
-    // Enforce that only SHA-256 PCRs (algorithm ID 0) are present.
-    // The GCP path only verifies SHA-256 PCRs (covered by the TPM Quote's
-    // PCR digest and the AK certificate chain). Any other bank would be
-    // unverified data passed through to the output.
-    if decoded.pcrs.is_empty() {
-        return Err(InvalidAttestReason::MissingSha256Pcrs.into());
-    }
-    for (alg_id, pcr_idx) in decoded.pcrs.keys() {
-        if *alg_id != 0 {
-            return Err(InvalidAttestReason::UnexpectedPcrAlgorithmGcp {
-                alg_id: *alg_id,
-                pcr_idx: *pcr_idx,
-            }
-            .into());
-        }
-    }
-
-    // Enforce all 24 SHA-256 PCRs are present.
-    // Complete, unambiguous PCR state — no selective omission.
-    for pcr_idx in 0..24u8 {
-        if !decoded.pcrs.contains_key(&(0, pcr_idx)) {
-            return Err(InvalidAttestReason::MissingPcr { index: pcr_idx }.into());
-        }
-    }
-
-    // Reject any PCR indices outside 0-23
-    for (_alg_id, pcr_idx) in decoded.pcrs.keys() {
-        if *pcr_idx > 23 {
-            return Err(InvalidAttestReason::PcrIndexOutOfRange { index: *pcr_idx }.into());
-        }
-    }
-
-    // Parse TPM2_Quote attestation (structure only — not yet authenticated)
-    let quote_info = parse_quote_attest(&decoded.quote_attest)?;
-
     let (certs, provider) = verify_gcp_certs(cert_chain_der, time)?;
 
-    // Extract AK public key from leaf certificate for comparison
+    // Verify AK public key from cert chain matches the decoded input
     let ak_pubkey_from_cert = extract_public_key(&certs[0])?;
-
-    // Verify the AK public key matches the one in the decoded input
-    if ak_pubkey_from_cert != decoded.ak_pubkey {
+    let ak_sec1 = decoded.ak_pubkey.to_sec1_uncompressed();
+    if ak_pubkey_from_cert != ak_sec1 {
         return Err(SignatureInvalidReason::AkPublicKeyMismatch.into());
     }
 
-    // Verify Quote signature with AK public key — this authenticates
-    // the quote data. All checks below trust the parsed quote_info
-    // because the signature covers the entire attest structure.
-    verify_ecdsa_p256(
-        &decoded.quote_attest,
-        &decoded.quote_signature,
-        &decoded.ak_pubkey,
-    )?;
+    // Verify TPM Quote: signature, PCR bank (SHA-256), nonce, PCR digest
+    let quote_info = verify_quote(decoded, PcrAlgorithm::Sha256)?;
 
-    // --- Quote is now authenticated; safe to trust its contents ---
-
-    // Enforce that the TPM Quote selects exactly one PCR bank: SHA-256 (0x000B),
-    // and that it selects all 24 PCRs (bitmap 0xFF 0xFF 0xFF).
-    if quote_info.pcr_select.len() != 1 {
-        return Err(InvalidAttestReason::MultiplePcrBanks {
-            count: quote_info.pcr_select.len(),
-        }
-        .into());
-    }
-    let (quote_alg, quote_bitmap) = &quote_info.pcr_select[0];
-    if *quote_alg != 0x000B {
-        return Err(InvalidAttestReason::WrongPcrAlgorithm {
-            expected: 0x000B,
-            got: *quote_alg,
-        }
-        .into());
-    }
-    if quote_bitmap.len() < 3
-        || quote_bitmap[0] != 0xFF
-        || quote_bitmap[1] != 0xFF
-        || quote_bitmap[2] != 0xFF
-    {
-        return Err(InvalidAttestReason::PartialPcrBitmap.into());
-    }
-
-    // Verify nonce matches Quote
-    if decoded.nonce != quote_info.nonce.as_slice() {
-        return Err(InvalidAttestReason::NonceMismatch.into());
-    }
-
-    // Verify PCR digest matches claimed PCR values
-    verify_pcr_digest_matches(&quote_info, &decoded.pcrs)?;
-
-    // Convert nonce to fixed-size array
     let nonce: [u8; 32] = quote_info
         .nonce
         .as_slice()

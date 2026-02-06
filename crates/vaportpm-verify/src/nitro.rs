@@ -16,10 +16,10 @@ use pki_types::UnixTime;
 
 use crate::error::{
     CborParseReason, CertificateParseReason, ChainValidationReason, CoseVerifyReason,
-    InvalidAttestReason, NoValidAttestationReason, PcrIndexOutOfBoundsReason,
-    SignatureInvalidReason, VerifyError,
+    InvalidAttestReason, PcrIndexOutOfBoundsReason, SignatureInvalidReason, VerifyError,
 };
-use crate::tpm::{parse_quote_attest, verify_ecdsa_p256, verify_pcr_digest_matches, TpmQuoteInfo};
+use crate::pcr::PcrAlgorithm;
+use crate::tpm::{verify_quote, TpmQuoteInfo};
 use crate::x509::{extract_public_key, validate_tpm_cert_chain};
 use crate::CloudProvider;
 use crate::{roots, DecodedAttestationOutput, VerificationResult};
@@ -30,10 +30,10 @@ struct NitroDocument {
     /// TPM PCR values from Nitro document's `nitrotpm_pcrs` field (index -> SHA-384 digest)
     /// These are the PCR values signed by AWS hardware.
     pub pcrs: BTreeMap<u8, Vec<u8>>,
-    /// Public key (raw bytes, if provided)
-    pub public_key: Option<Vec<u8>>,
-    /// Nonce (raw bytes, if provided)
-    pub nonce: Option<Vec<u8>>,
+    /// AK public key bound by the Nitro document (raw SEC1 bytes)
+    pub public_key: Vec<u8>,
+    /// Nonce signed by the Nitro document (raw bytes)
+    pub nonce: Vec<u8>,
 }
 
 /// Verify Nitro TPM attestation with pre-decoded data
@@ -62,12 +62,16 @@ pub fn verify_nitro_decoded(
     // Establish that this document came from AWS before parsing its contents.
     let (nitro_doc, provider) = verify_nitro_cose_chain(document_bytes, time)?;
 
-    // === Phase 2: Verify TPM Quote authenticity ===
-    // The Nitro document binds the AK public key — verify the Quote was
-    // signed by that key.
-    let quote_info = verify_tpm_quote_signature(decoded, &nitro_doc)?;
+    // === Phase 2: AK binding — Nitro document must agree on which key signed the Quote ===
+    let ak_sec1 = decoded.ak_pubkey.to_sec1_uncompressed();
+    if ak_sec1.as_slice() != nitro_doc.public_key.as_slice() {
+        return Err(SignatureInvalidReason::AkPublicKeyMismatch.into());
+    }
 
-    // === Phase 3: Cross-verify all authenticated data ===
+    // === Phase 3: Verify TPM Quote (signature, PCR bank, nonce, PCR digest) ===
+    let quote_info = verify_quote(decoded, PcrAlgorithm::Sha384)?;
+
+    // === Phase 4: Cross-verify Nitro-specific bindings ===
     verify_nitro_bindings(decoded, &quote_info, &nitro_doc)?;
 
     // Convert nonce to fixed-size array
@@ -154,154 +158,43 @@ fn verify_nitro_cose_chain(
     Ok((nitro_doc, provider))
 }
 
-/// Phase 2: Verify the TPM Quote was signed by the AK that the Nitro document binds.
+/// Cross-verify Nitro-specific bindings after the TPM Quote has been authenticated.
 ///
-/// Returns the authenticated TpmQuoteInfo.
-fn verify_tpm_quote_signature(
-    decoded: &DecodedAttestationOutput,
-    nitro_doc: &NitroDocument,
-) -> Result<TpmQuoteInfo, VerifyError> {
-    // The Nitro document's public_key field tells us which AK to trust.
-    // Verify the claimed AK matches before we use it for signature verification.
-    let signed_pubkey = nitro_doc
-        .public_key
-        .as_ref()
-        .ok_or(NoValidAttestationReason::MissingPublicKey)?;
-
-    if decoded.ak_pubkey.as_slice() != signed_pubkey.as_slice() {
-        return Err(SignatureInvalidReason::AkNitroBindingMismatch.into());
-    }
-
-    // Parse and verify TPM2_Quote
-    let quote_info = parse_quote_attest(&decoded.quote_attest)?;
-
-    verify_ecdsa_p256(
-        &decoded.quote_attest,
-        &decoded.quote_signature,
-        &decoded.ak_pubkey,
-    )?;
-
-    // --- Quote is now authenticated; safe to trust its contents ---
-
-    Ok(quote_info)
-}
-
-/// Phase 3: Cross-verify all authenticated data from the Nitro document and TPM Quote.
-///
-/// At this point both the Nitro document (COSE) and TPM Quote (ECDSA) are
-/// authenticated. This function verifies they agree on nonce, PCR values,
-/// and PCR digest.
+/// At this point the COSE document (AWS-signed) and TPM Quote (AK-signed) are
+/// both authenticated. This verifies Nitro-specific consistency:
+/// - COSE nonce matches Quote nonce
+/// - PCR bank is SHA-384 (Nitro requirement)
+/// - COSE-signed PCR values match decoded PCR values (bidirectional)
 fn verify_nitro_bindings(
     decoded: &DecodedAttestationOutput,
     quote_info: &TpmQuoteInfo,
     nitro_doc: &NitroDocument,
 ) -> Result<(), VerifyError> {
-    // --- Quote structure enforcement ---
-
-    // Exactly one PCR bank: SHA-384 (0x000C), all 24 PCRs selected.
-    if quote_info.pcr_select.len() != 1 {
-        return Err(InvalidAttestReason::MultiplePcrBanks {
-            count: quote_info.pcr_select.len(),
-        }
-        .into());
-    }
-    let (quote_alg, quote_bitmap) = &quote_info.pcr_select[0];
-    if *quote_alg != 0x000C {
-        return Err(InvalidAttestReason::WrongPcrAlgorithm {
-            expected: 0x000C,
-            got: *quote_alg,
-        }
-        .into());
-    }
-    if quote_bitmap.len() < 3
-        || quote_bitmap[0] != 0xFF
-        || quote_bitmap[1] != 0xFF
-        || quote_bitmap[2] != 0xFF
-    {
-        return Err(InvalidAttestReason::PartialPcrBitmap.into());
-    }
-
-    // --- Nonce verification ---
-
-    if decoded.nonce != quote_info.nonce.as_slice() {
-        return Err(InvalidAttestReason::NonceMismatch.into());
-    }
-
-    let signed_nonce = nitro_doc
-        .nonce
-        .as_ref()
-        .ok_or(NoValidAttestationReason::MissingNonce)?;
-
-    if quote_info.nonce.as_slice() != signed_nonce.as_slice() {
+    // --- Nonce: COSE document must agree with authenticated Quote ---
+    if quote_info.nonce.as_slice() != nitro_doc.nonce.as_slice() {
         return Err(SignatureInvalidReason::NitroNonceMismatch.into());
     }
 
-    // --- PCR enforcement ---
-
-    // Only SHA-384 PCRs allowed (algorithm ID 1). Any other bank would be
-    // unverified data passed through to the output.
-    if decoded.pcrs.is_empty() {
-        return Err(InvalidAttestReason::MissingSha384Pcrs.into());
-    }
-
-    for (alg_id, pcr_idx) in decoded.pcrs.keys() {
-        if *alg_id != 1 {
-            return Err(InvalidAttestReason::UnexpectedPcrAlgorithmNitro {
-                alg_id: *alg_id,
-                pcr_idx: *pcr_idx,
-            }
-            .into());
-        }
-        if *pcr_idx > 23 {
-            return Err(InvalidAttestReason::PcrIndexOutOfRange { index: *pcr_idx }.into());
-        }
-    }
-
-    // All 24 PCRs must be present — complete, unambiguous state.
-    for pcr_idx in 0..24u8 {
-        if !decoded.pcrs.contains_key(&(1, pcr_idx)) {
-            return Err(InvalidAttestReason::MissingPcr { index: pcr_idx }.into());
-        }
-    }
-
-    // --- Bidirectional PCR match against Nitro-signed values ---
-
+    // --- Bidirectional PCR match against COSE-signed values ---
     let signed_pcrs = &nitro_doc.pcrs;
     if signed_pcrs.is_empty() {
         return Err(InvalidAttestReason::EmptySignedPcrs.into());
     }
 
+    // Forward: every COSE-signed PCR must match the decoded value
     for (idx, signed_value) in signed_pcrs.iter() {
-        match decoded.pcrs.get(&(1, *idx)) {
-            Some(claimed_value) if claimed_value == signed_value => {}
-            Some(_) => {
-                return Err(SignatureInvalidReason::PcrValueMismatch { index: *idx }.into());
-            }
-            None => {
-                // Note: This should never happen! But is defense-in-depth
-                // the 'all 24 PCRs' check guarantees decoded.pcrs contains (1,0) through (1,23)
-                // extract_cbor_pcrs caps Nitro PCR indices at 23
-                return Err(
-                    SignatureInvalidReason::PcrMissingFromAttestation { index: *idx }.into(),
-                );
-            }
+        let claimed_value = decoded.pcrs.get(*idx as usize);
+        if claimed_value != signed_value.as_slice() {
+            return Err(SignatureInvalidReason::PcrValueMismatch { index: *idx }.into());
         }
     }
 
-    for (_alg_id, pcr_idx) in decoded.pcrs.keys() {
-        if !signed_pcrs.contains_key(pcr_idx) {
-            return Err(InvalidAttestReason::PcrNotSigned {
-                pcr_index: *pcr_idx,
-            }
-            .into());
+    // Reverse: every decoded PCR index must be present in COSE-signed PCRs
+    for pcr_idx in 0..24u8 {
+        if !signed_pcrs.contains_key(&pcr_idx) {
+            return Err(InvalidAttestReason::PcrNotSigned { pcr_index: pcr_idx }.into());
         }
     }
-
-    // --- PCR digest: cryptographic binding ---
-    // COSE signature authenticates the Nitro document (including PCR values).
-    // ECDSA signature authenticates the TPM Quote (including PCR digest).
-    // This check proves the PCR digest covers the same values.
-    verify_pcr_digest_matches(quote_info, &decoded.pcrs)?;
 
     Ok(())
 }
@@ -317,9 +210,9 @@ fn parse_nitro_document(map: &[(CborValue, CborValue)]) -> Result<NitroDocument,
     // Parse PCRs (binary)
     let pcrs = extract_cbor_pcrs(map)?;
 
-    // Optional fields (binary)
-    let public_key = extract_cbor_bytes_optional(map, "public_key");
-    let nonce = extract_cbor_bytes_optional(map, "nonce");
+    // Required fields (binary)
+    let public_key = extract_cbor_bytes(map, "public_key")?;
+    let nonce = extract_cbor_bytes(map, "nonce")?;
 
     Ok(NitroDocument {
         pcrs,
@@ -360,23 +253,6 @@ fn extract_cbor_bytes(
         }
     }
     Err(CborParseReason::MissingField { field: key }.into())
-}
-
-/// Extract optional bytes field from CBOR map
-fn extract_cbor_bytes_optional(map: &[(CborValue, CborValue)], key: &str) -> Option<Vec<u8>> {
-    for (k, v) in map {
-        if let CborValue::Text(k_text) = k {
-            if k_text == key {
-                if let CborValue::Bytes(val) = v {
-                    return Some(val.clone());
-                }
-                if let CborValue::Null = v {
-                    return None;
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Extract byte array field from CBOR map
@@ -610,30 +486,6 @@ mod tests {
             result,
             Err(VerifyError::CborParse(CborParseReason::MissingField { .. }))
         ));
-    }
-
-    #[test]
-    fn test_extract_cbor_bytes_optional_present() {
-        let map = vec![(
-            CborValue::Text("data".to_string()),
-            CborValue::Bytes(vec![1, 2, 3]),
-        )];
-        let result = extract_cbor_bytes_optional(&map, "data");
-        assert_eq!(result, Some(vec![1, 2, 3]));
-    }
-
-    #[test]
-    fn test_extract_cbor_bytes_optional_null() {
-        let map = vec![(CborValue::Text("data".to_string()), CborValue::Null)];
-        let result = extract_cbor_bytes_optional(&map, "data");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_extract_cbor_bytes_optional_missing() {
-        let map: Vec<(CborValue, CborValue)> = vec![];
-        let result = extract_cbor_bytes_optional(&map, "data");
-        assert_eq!(result, None);
     }
 
     #[test]

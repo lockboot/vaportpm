@@ -3,12 +3,10 @@
 use pki_types::UnixTime;
 use risc0_zkvm::guest::env;
 use serde::{Deserialize, Serialize};
-use serde_big_array::BigArray;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::io::Read;
 use std::time::Duration;
-use vaportpm_verify::{flat, verify_decoded_attestation_output, CloudProvider};
+use vaportpm_verify::{flat, verify_decoded_attestation_output, CloudProvider, P256PublicKey, PcrBank};
 
 risc0_zkvm::guest::entry!(main);
 
@@ -16,8 +14,7 @@ risc0_zkvm::guest::entry!(main);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZkPublicInputs {
     pub pcr_hash: [u8; 32],
-    #[serde(with = "BigArray")]
-    pub ak_pubkey: [u8; 65],
+    pub ak_pubkey: P256PublicKey,
     pub nonce: [u8; 32],
     pub provider: u8,
     pub verified_at: u64,
@@ -45,7 +42,7 @@ fn main() {
         verify_decoded_attestation_output(&decoded, time).expect("Attestation verification failed");
 
     // Compute canonical PCR hash from pre-decoded binary data
-    let pcr_hash = compute_pcr_hash_decoded(&decoded.pcrs);
+    let pcr_hash = compute_pcr_hash(&decoded.pcrs);
 
     // Map provider to u8 (root hash already verified against known roots)
     let provider = match result.provider {
@@ -65,28 +62,19 @@ fn main() {
     env::commit(&public_inputs);
 }
 
-/// Compute canonical PCR hash from pre-decoded binary PCR data
+/// Compute canonical PCR hash from a validated PcrBank
 ///
-/// Canonicalization: sort by algorithm ID, then by PCR index
-fn compute_pcr_hash_decoded(pcrs: &BTreeMap<(u8, u8), Vec<u8>>) -> [u8; 32] {
+/// Canonicalization: [alg_u16 LE, count] then each [idx, value...] in index order
+fn compute_pcr_hash(pcrs: &PcrBank) -> [u8; 32] {
     let mut hasher = Sha256::new();
 
-    // Group PCRs by algorithm
-    let mut by_alg: BTreeMap<u8, BTreeMap<u8, &Vec<u8>>> = BTreeMap::new();
-    for ((alg_id, idx), value) in pcrs {
-        by_alg.entry(*alg_id).or_default().insert(*idx, value);
-    }
+    let alg_u16 = pcrs.algorithm() as u16;
+    hasher.update(alg_u16.to_le_bytes());
+    hasher.update([24u8]);
 
-    // Process in algorithm order (0=sha256, 1=sha384)
-    for (alg_id, pcr_map) in &by_alg {
-        // Add algorithm ID and PCR count (2 bytes total)
-        hasher.update(&[*alg_id, pcr_map.len() as u8]);
-
-        // BTreeMap is already sorted by key
-        for (idx, value_bytes) in pcr_map {
-            hasher.update(&[*idx]);
-            hasher.update(*value_bytes);
-        }
+    for (idx, value) in pcrs.values().enumerate() {
+        hasher.update([idx as u8]);
+        hasher.update(value);
     }
 
     hasher.finalize().into()

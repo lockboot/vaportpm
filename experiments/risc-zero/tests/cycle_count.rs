@@ -121,6 +121,6 @@ fn test_data_size_comparison() {
     }
 
     let pcr_bytes: usize = decoded.pcrs.values().map(|v| v.len()).sum();
-    println!("  pcrs: {} entries, {} total bytes", decoded.pcrs.len(), pcr_bytes);
+    println!("  pcrs: {} entries, {} total bytes", vaportpm_verify::PCR_COUNT, pcr_bytes);
     println!();
 }

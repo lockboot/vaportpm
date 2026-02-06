@@ -15,6 +15,7 @@ use ecdsa::signature::hazmat::PrehashSigner;
 use p256::pkcs8::DecodePrivateKey as _;
 use sha2::{Digest, Sha256, Sha384};
 
+use crate::pcr::{P256PublicKey, PcrAlgorithm, PcrBank};
 use crate::roots::{register_test_root, TestRootGuard};
 use crate::x509::hash_public_key;
 use crate::{CloudProvider, DecodedAttestationOutput, DecodedPlatformAttestation};
@@ -31,7 +32,7 @@ const TPM_ST_ATTEST_QUOTE: u16 = 0x8018;
 
 /// Build a raw TPM2B_ATTEST (Quote) structure.
 ///
-/// `pcr_select`: list of `(alg_u16, bitmap_bytes)` — e.g. `(0x000C, vec![0xFF, 0xFF, 0xFF])`.
+/// `pcr_select`: list of `(alg_u16, bitmap_bytes)` — e.g. `(PcrAlgorithm::Sha384 as u16, vec![0xFF, 0xFF, 0xFF])`.
 /// `pcr_digest`: the SHA-256 of concatenated selected PCR values.
 pub fn build_tpm_quote_attest(
     nonce: &[u8; 32],
@@ -76,9 +77,9 @@ pub fn build_tpm_quote_attest(
 }
 
 /// Compute the PCR digest (SHA-256 of concatenated PCR values in index order).
-pub fn compute_pcr_digest(pcrs: &BTreeMap<(u8, u8), Vec<u8>>) -> Vec<u8> {
+pub fn compute_pcr_digest(pcrs: &PcrBank) -> Vec<u8> {
     let mut hasher = Sha256::new();
-    for ((_alg, _idx), value) in pcrs {
+    for value in pcrs.values() {
         hasher.update(value);
     }
     hasher.finalize().to_vec()
@@ -295,8 +296,8 @@ pub struct GcpChainKeys {
     pub leaf_der: Vec<u8>,
     /// AK signing key (P-256, PKCS8 DER) — from the leaf cert
     pub ak_signing_key: Vec<u8>,
-    /// AK public key (SEC1 uncompressed, 65 bytes)
-    pub ak_pubkey: [u8; 65],
+    /// AK public key (P-256)
+    pub ak_pubkey: P256PublicKey,
     /// Root public key hash (SHA-256)
     pub root_pubkey_hash: [u8; 32],
 }
@@ -332,8 +333,7 @@ pub fn generate_gcp_chain() -> GcpChainKeys {
     let leaf_x509 =
         x509_cert::Certificate::from_der(leaf_cert.der()).expect("leaf cert should parse");
     let ak_pubkey_vec = crate::x509::extract_public_key(&leaf_x509).unwrap();
-    let mut ak_pubkey = [0u8; 65];
-    ak_pubkey.copy_from_slice(&ak_pubkey_vec);
+    let ak_pubkey = P256PublicKey::from_sec1_uncompressed(&ak_pubkey_vec).unwrap();
 
     // Compute root pubkey hash
     let root_x509 =
@@ -362,22 +362,22 @@ pub fn ephemeral_time() -> UnixTime {
     UnixTime::since_unix_epoch(Duration::from_secs(EPHEMERAL_TIMESTAMP_SECS))
 }
 
-/// Build 24 SHA-384 PCR values (for Nitro). Value = vec![idx; 48].
-pub fn make_nitro_pcrs() -> BTreeMap<(u8, u8), Vec<u8>> {
-    let mut pcrs = BTreeMap::new();
+/// Build 24 SHA-384 PCR values (for Nitro).
+pub fn make_nitro_pcrs() -> PcrBank {
+    let mut m = BTreeMap::new();
     for idx in 0u8..24 {
-        pcrs.insert((1, idx), vec![idx; 48]); // alg_id 1 = SHA-384
+        m.insert((PcrAlgorithm::Sha384 as u16, idx), vec![idx; 48]);
     }
-    pcrs
+    PcrBank::from_btree_map(&m).unwrap()
 }
 
-/// Build 24 SHA-256 PCR values (for GCP). Value = vec![idx; 32].
-pub fn make_gcp_pcrs() -> BTreeMap<(u8, u8), Vec<u8>> {
-    let mut pcrs = BTreeMap::new();
+/// Build 24 SHA-256 PCR values (for GCP).
+pub fn make_gcp_pcrs() -> PcrBank {
+    let mut m = BTreeMap::new();
     for idx in 0u8..24 {
-        pcrs.insert((0, idx), vec![idx; 32]); // alg_id 0 = SHA-256
+        m.insert((PcrAlgorithm::Sha256 as u16, idx), vec![idx; 32]);
     }
-    pcrs
+    PcrBank::from_btree_map(&m).unwrap()
 }
 
 /// Build a complete, cryptographically valid Nitro attestation.
@@ -386,7 +386,7 @@ pub fn make_gcp_pcrs() -> BTreeMap<(u8, u8), Vec<u8>> {
 /// The guard must be held alive for the duration of the test.
 pub fn build_valid_nitro(
     nonce: &[u8; 32],
-    pcrs: &BTreeMap<(u8, u8), Vec<u8>>,
+    pcrs: &PcrBank,
 ) -> (DecodedAttestationOutput, UnixTime, TestRootGuard) {
     let chain = generate_nitro_chain();
 
@@ -401,28 +401,28 @@ pub fn build_valid_nitro(
     let ak_signing_key = p256::ecdsa::SigningKey::from_pkcs8_der(&ak_signing_key_pkcs8).unwrap();
     let ak_verifying_key = ak_signing_key.verifying_key();
     let ak_point = ak_verifying_key.to_encoded_point(false);
-    let mut ak_pubkey = [0u8; 65];
-    ak_pubkey.copy_from_slice(ak_point.as_bytes());
+    let ak_pubkey = P256PublicKey::from_sec1_uncompressed(ak_point.as_bytes()).unwrap();
 
     // Build TPM Quote
     let pcr_digest = compute_pcr_digest(pcrs);
-    let pcr_select = vec![(0x000Cu16, vec![0xFF, 0xFF, 0xFF])]; // SHA-384, all 24
+    let pcr_select = vec![(PcrAlgorithm::Sha384 as u16, vec![0xFF, 0xFF, 0xFF])];
     let quote_attest = build_tpm_quote_attest(nonce, &pcr_select, &pcr_digest);
     let quote_signature = sign_tpm_quote(&quote_attest, &ak_signing_key_pkcs8);
 
     // Build Nitro PCR map (index → value) for COSE document
     let mut nitro_pcrs = BTreeMap::new();
-    for ((alg, idx), val) in pcrs {
-        assert_eq!(*alg, 1, "Nitro PCRs must be SHA-384 (alg_id=1)");
-        nitro_pcrs.insert(*idx, val.clone());
+    for (idx, val) in pcrs.values().enumerate() {
+        nitro_pcrs.insert(idx as u8, val.to_vec());
     }
+
+    let ak_sec1 = ak_pubkey.to_sec1_uncompressed();
 
     // Build COSE document
     let cose_doc = build_nitro_cose_doc(
         &chain.leaf_der,
         std::slice::from_ref(&chain.root_der),
         &nitro_pcrs,
-        Some(&ak_pubkey),
+        Some(&ak_sec1),
         Some(nonce),
         &chain.cose_signing_key,
     );
@@ -444,7 +444,7 @@ pub fn build_valid_nitro(
 /// Returns `(DecodedAttestationOutput, UnixTime, TestRootGuard)`.
 pub fn build_valid_gcp(
     nonce: &[u8; 32],
-    pcrs: &BTreeMap<(u8, u8), Vec<u8>>,
+    pcrs: &PcrBank,
 ) -> (DecodedAttestationOutput, UnixTime, TestRootGuard) {
     let chain = generate_gcp_chain();
 
@@ -453,7 +453,7 @@ pub fn build_valid_gcp(
 
     // Build TPM Quote
     let pcr_digest = compute_pcr_digest(pcrs);
-    let pcr_select = vec![(0x000Bu16, vec![0xFF, 0xFF, 0xFF])]; // SHA-256, all 24
+    let pcr_select = vec![(PcrAlgorithm::Sha256 as u16, vec![0xFF, 0xFF, 0xFF])];
     let quote_attest = build_tpm_quote_attest(nonce, &pcr_select, &pcr_digest);
     let quote_signature = sign_tpm_quote(&quote_attest, &chain.ak_signing_key);
 

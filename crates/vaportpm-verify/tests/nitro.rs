@@ -11,7 +11,7 @@ use std::time::Duration;
 use vaportpm_verify::{
     verify_attestation_output, verify_decoded_attestation_output, ChainValidationReason,
     CloudProvider, DecodedAttestationOutput, DecodedPlatformAttestation, EccPublicKeyCoords,
-    InvalidAttestReason, UnixTime, VerifyError,
+    InvalidAttestReason, PcrAlgorithm, UnixTime, VerifyError,
 };
 
 use vaportpm_verify::AttestationOutput;
@@ -49,11 +49,7 @@ fn test_nitro_fixture_verifies() {
         hex::decode("230af3f7c0ec43ccf99a4cab47ac61469a36ea74b1e79740fdf8ccfc8f56161a").unwrap();
     assert_eq!(result.nonce.as_slice(), expected_nonce.as_slice());
 
-    assert!(!result.pcrs.is_empty());
-
-    // Verify SHA-384 PCRs are present
-    let has_sha384 = result.pcrs.keys().any(|(alg_id, _)| *alg_id == 1);
-    assert!(has_sha384, "Should have SHA-384 PCRs");
+    assert_eq!(result.pcrs.algorithm(), PcrAlgorithm::Sha384);
 }
 
 // =============================================================================
@@ -142,8 +138,8 @@ fn test_nitro_reject_tampered_nonce_correct_length() {
 
 /// Attacker modifies a SHA-384 PCR value.
 ///
-/// Detected at: nitro.rs — claimed PCR values don't match the signed
-/// values in the Nitro NSM document.
+/// Detected at: tpm.rs verify_quote — PCR digest computed from tampered values
+/// doesn't match the authenticated digest in the TPM Quote.
 #[test]
 fn test_nitro_reject_tampered_pcr_values() {
     let mut output = load_nitro_fixture();
@@ -157,7 +153,12 @@ fn test_nitro_reject_tampered_pcr_values() {
 
     let result = verify_attestation_output(&output, nitro_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::SignatureInvalid(_))),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::PcrDigestMismatch
+            ))
+        ),
         "Should reject tampered PCR values, got: {:?}",
         result
     );
@@ -280,19 +281,20 @@ fn test_nitro_reject_cert_expired() {
 /// Nitro verification explicitly requires SHA-384 PCRs and rejects
 /// any non-SHA-384 bank.
 ///
-/// Detected at: nitro.rs — non-SHA-384 PCR rejection
+/// Detected at: nitro.rs — WrongPcrBankAlgorithm check
 #[test]
 fn test_nitro_reject_non_sha384_pcrs() {
     let mut output = load_nitro_fixture();
 
-    // Remove the SHA-384 bank entirely, substitute a SHA-256 entry
-    // so that decode() doesn't fail on empty PCRs
+    // Remove the SHA-384 bank entirely, substitute 24 SHA-256 entries
+    // so that PcrBank::from_btree_map succeeds. Nitro then rejects it
+    // with WrongPcrBankAlgorithm.
     output.pcrs.remove("sha384");
     let mut sha256_pcrs = BTreeMap::new();
-    sha256_pcrs.insert(
-        0u8,
-        "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-    );
+    let sha256_zero = "0".repeat(64); // 32 bytes = 64 hex chars
+    for idx in 0u8..24 {
+        sha256_pcrs.insert(idx, sha256_zero.clone());
+    }
     output.pcrs.insert("sha256".to_string(), sha256_pcrs);
 
     let result = verify_attestation_output(&output, nitro_fixture_time());
@@ -300,7 +302,10 @@ fn test_nitro_reject_non_sha384_pcrs() {
         matches!(
             result,
             Err(VerifyError::InvalidAttest(
-                InvalidAttestReason::UnexpectedPcrAlgorithmNitro { .. }
+                InvalidAttestReason::WrongPcrBankAlgorithm {
+                    expected: PcrAlgorithm::Sha384,
+                    got: PcrAlgorithm::Sha256,
+                }
             ))
         ),
         "Should reject attestation with non-SHA-384 PCRs, got: {:?}",
@@ -309,15 +314,15 @@ fn test_nitro_reject_non_sha384_pcrs() {
 }
 
 /// Attestation has SHA-384 PCRs but also includes SHA-256 PCRs.
-/// The Nitro path must reject extra unverified PCR banks — they would
-/// pass through to the output as unverified data.
+/// PcrBank rejects mixed algorithms at decode time.
 ///
-/// Detected at: nitro.rs — non-SHA-384 PCR rejection
+/// Detected at: PcrBank::from_btree_map — PcrBankMixedAlgorithms
 #[test]
 fn test_nitro_reject_extra_sha256_pcrs() {
     let mut output = load_nitro_fixture();
 
-    // Add a SHA-256 bank alongside the existing SHA-384 bank
+    // Add a SHA-256 bank alongside the existing SHA-384 bank.
+    // PcrBank::from_btree_map rejects mixed algorithms.
     let mut sha256_pcrs = BTreeMap::new();
     sha256_pcrs.insert(
         0u8,
@@ -330,7 +335,7 @@ fn test_nitro_reject_extra_sha256_pcrs() {
         matches!(
             result,
             Err(VerifyError::InvalidAttest(
-                InvalidAttestReason::UnexpectedPcrAlgorithmNitro { .. }
+                InvalidAttestReason::PcrBankMixedAlgorithms
             ))
         ),
         "Should reject attestation with extra SHA-256 PCRs alongside SHA-384, got: {:?}",
@@ -380,106 +385,11 @@ fn test_nitro_decoded_reject_corrupted_cose_document() {
     );
 }
 
-/// Empty PCR map at the decoded level.
-///
-/// The COSE and ECDSA signatures still pass (unmodified), but Phase 3
-/// rejects the empty PCRs before cross-verification.
-///
-/// Covers: nitro.rs — "Missing SHA-384 PCRs - required for Nitro attestation"
-#[test]
-fn test_nitro_decoded_reject_empty_pcrs() {
-    let mut decoded = decode_nitro_fixture();
-    decoded.pcrs.clear();
-
-    let result = verify_decoded_attestation_output(&decoded, nitro_fixture_time());
-    assert!(
-        matches!(
-            result,
-            Err(VerifyError::InvalidAttest(
-                InvalidAttestReason::MissingSha384Pcrs
-            ))
-        ),
-        "Should reject empty PCRs, got: {:?}",
-        result
-    );
-}
-
-/// Decoded PCRs contain a non-SHA-384 entry (alg_id=0 is SHA-256).
-///
-/// Covers: nitro.rs — "non-SHA-384 PCR" rejection at decoded level
-#[test]
-fn test_nitro_decoded_reject_non_sha384_pcr() {
-    let mut decoded = decode_nitro_fixture();
-
-    // Replace all PCRs with SHA-256 (alg_id=0) entries
-    let sha384_values: Vec<(u8, Vec<u8>)> = decoded
-        .pcrs
-        .iter()
-        .filter(|((alg, _), _)| *alg == 1)
-        .map(|((_alg, idx), val)| (*idx, val.clone()))
-        .collect();
-
-    decoded.pcrs.clear();
-    for (idx, val) in sha384_values {
-        // Insert as SHA-256 (alg_id=0) instead of SHA-384 (alg_id=1)
-        decoded.pcrs.insert((0, idx), val);
-    }
-
-    let result = verify_decoded_attestation_output(&decoded, nitro_fixture_time());
-    assert!(
-        matches!(
-            result,
-            Err(VerifyError::InvalidAttest(
-                InvalidAttestReason::UnexpectedPcrAlgorithmNitro { .. }
-            ))
-        ),
-        "Should reject non-SHA-384 PCRs at decoded level, got: {:?}",
-        result
-    );
-}
-
-/// Decoded PCRs contain an index above 23.
-///
-/// Covers: nitro.rs — "PCR index {} out of range; only PCRs 0-23 are valid"
-#[test]
-fn test_nitro_decoded_reject_pcr_index_out_of_range() {
-    let mut decoded = decode_nitro_fixture();
-
-    // Add a PCR with index 24 (out of range)
-    decoded.pcrs.insert((1, 24), vec![0x00; 48]);
-
-    let result = verify_decoded_attestation_output(&decoded, nitro_fixture_time());
-    assert!(
-        matches!(
-            result,
-            Err(VerifyError::InvalidAttest(
-                InvalidAttestReason::PcrIndexOutOfRange { .. }
-            ))
-        ),
-        "Should reject PCR index > 23, got: {:?}",
-        result
-    );
-}
-
-/// Decoded PCRs are missing one of the 24 required SHA-384 entries.
-///
-/// Covers: nitro.rs — "Missing SHA-384 PCR {} - all 24 PCRs (0-23) are required"
-#[test]
-fn test_nitro_decoded_reject_missing_pcr() {
-    let mut decoded = decode_nitro_fixture();
-
-    // Remove PCR 5 (arbitrary choice)
-    decoded.pcrs.remove(&(1, 5));
-
-    let result = verify_decoded_attestation_output(&decoded, nitro_fixture_time());
-    assert!(
-        matches!(
-            result,
-            Err(VerifyError::InvalidAttest(
-                InvalidAttestReason::MissingPcr { .. }
-            ))
-        ),
-        "Should reject missing SHA-384 PCR, got: {:?}",
-        result
-    );
-}
+// Note: The following decoded-level PCR mutation tests were removed because
+// PcrBank makes invalid PCR states unrepresentable at the type level:
+// - test_nitro_decoded_reject_empty_pcrs (PcrBank always has 24 values)
+// - test_nitro_decoded_reject_non_sha384_pcr (PcrBank has single algorithm)
+// - test_nitro_decoded_reject_pcr_index_out_of_range (PcrBank indices are 0-23)
+// - test_nitro_decoded_reject_missing_pcr (PcrBank has all 24)
+//
+// These invariants are now tested in pcr.rs unit tests via PcrBank::from_btree_map.

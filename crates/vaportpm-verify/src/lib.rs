@@ -12,13 +12,14 @@
 mod error;
 mod gcp;
 mod nitro;
+pub mod pcr;
 mod tpm;
 mod x509;
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-use serde_big_array::BigArray;
+use serde::Serialize;
+use x509::parse_cert_chain_pem;
 
 // Re-export error types
 pub use error::{
@@ -27,17 +28,8 @@ pub use error::{
     SignatureInvalidReason, VerifyError,
 };
 
-// Re-export TPM types and functions (only those used by verification paths)
-pub use tpm::{parse_quote_attest, verify_ecdsa_p256, verify_pcr_digest_matches, TpmQuoteInfo};
-
-// Re-export from vaportpm_attest
-pub use vaportpm_attest::TpmAlg;
-
-// Re-export X.509 utility functions
-pub use x509::{
-    extract_public_key, hash_public_key, parse_and_validate_tpm_cert_chain, parse_cert_chain_pem,
-    validate_tpm_cert_chain, ChainValidationResult, MAX_CHAIN_DEPTH,
-};
+// Re-export PCR types
+pub use pcr::{P256PublicKey, PcrAlgorithm, PcrBank, PCR_COUNT};
 
 // Re-export time type for testing
 pub use pki_types::UnixTime;
@@ -148,18 +140,16 @@ pub use vaportpm_attest::a9n::{
 ///
 /// This struct holds pre-decoded attestation data for efficient verification
 /// in constrained environments (e.g., zkVM guests) where text parsing is expensive.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct DecodedAttestationOutput {
     /// Nonce (32 bytes, already decoded from hex)
     pub nonce: [u8; 32],
 
-    /// PCR values: (algorithm_id, pcr_index) → value
-    /// Algorithm IDs: 0 = SHA-256, 1 = SHA-384
-    pub pcrs: BTreeMap<(u8, u8), Vec<u8>>,
+    /// Validated PCR bank (single algorithm, exactly 24 values)
+    pub pcrs: PcrBank,
 
-    /// AK public key (65 bytes SEC1 uncompressed: 0x04 || x || y)
-    #[serde(with = "BigArray")]
-    pub ak_pubkey: [u8; 65],
+    /// AK public key (P-256)
+    pub ak_pubkey: P256PublicKey,
 
     /// TPM Quote attest_data (raw bytes)
     pub quote_attest: Vec<u8>,
@@ -172,7 +162,7 @@ pub struct DecodedAttestationOutput {
 }
 
 /// Platform-specific attestation data in decoded binary format
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum DecodedPlatformAttestation {
     /// GCP: certificate chain as DER bytes (leaf first)
     Gcp { cert_chain_der: Vec<Vec<u8>> },
@@ -202,10 +192,7 @@ impl DecodedAttestationOutput {
             .ok_or(NoValidAttestationReason::MissingAkPublicKey)?;
         let ak_x = hex::decode(&ak_pk.x)?;
         let ak_y = hex::decode(&ak_pk.y)?;
-        let mut ak_pubkey = [0u8; 65];
-        ak_pubkey[0] = 0x04;
-        ak_pubkey[1..33].copy_from_slice(&ak_x);
-        ak_pubkey[33..65].copy_from_slice(&ak_y);
+        let ak_pubkey = P256PublicKey::from_coords(&ak_x, &ak_y)?;
 
         let tpm = output
             .attestation
@@ -215,18 +202,19 @@ impl DecodedAttestationOutput {
         let quote_attest = hex::decode(&tpm.attest_data)?;
         let quote_signature = hex::decode(&tpm.signature)?;
 
-        let mut pcrs = BTreeMap::new();
+        let mut pcrs_raw = BTreeMap::new();
         for (alg_name, pcr_map) in &output.pcrs {
             let alg_id = match alg_name.as_str() {
-                "sha256" => 0u8,
-                "sha384" => 1u8,
+                "sha256" => PcrAlgorithm::Sha256 as u16,
+                "sha384" => PcrAlgorithm::Sha384 as u16,
                 _ => continue,
             };
             for (idx, hex_value) in pcr_map {
                 let value = hex::decode(hex_value)?;
-                pcrs.insert((alg_id, *idx), value);
+                pcrs_raw.insert((alg_id, *idx), value);
             }
         }
+        let pcrs = PcrBank::from_btree_map(&pcrs_raw)?;
 
         let platform = if let Some(ref gcp) = output.attestation.gcp {
             let certs = parse_cert_chain_pem(&gcp.ak_cert_chain)?;
@@ -275,15 +263,14 @@ pub fn verify_decoded_attestation_output(
 }
 
 /// Result of successful attestation verification
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct VerificationResult {
     /// The nonce that was verified (32 bytes)
     pub nonce: [u8; 32],
     /// Cloud provider that issued the attestation
     pub provider: CloudProvider,
-    /// PCR values from the attestation: (algorithm_id, pcr_index) -> raw digest bytes
-    /// Algorithm IDs: 0 = SHA-256, 1 = SHA-384
-    pub pcrs: BTreeMap<(u8, u8), Vec<u8>>,
+    /// Validated PCR bank from the attestation
+    pub pcrs: PcrBank,
     /// Timestamp when verification was performed (seconds since Unix epoch)
     pub verified_at: u64,
 }

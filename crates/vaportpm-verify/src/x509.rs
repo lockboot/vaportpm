@@ -23,7 +23,7 @@ const OID_BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.
 /// Key Usage extension flags (OID 2.5.29.15)
 /// Only includes bits used for TPM certificate chain validation.
 #[derive(Debug, Clone, Default)]
-pub struct KeyUsageFlags {
+pub(crate) struct KeyUsageFlags {
     /// digitalSignature (bit 0) - key can be used to verify digital signatures
     pub digital_signature: bool,
     /// keyCertSign (bit 5) - key can be used to verify certificate signatures
@@ -32,7 +32,7 @@ pub struct KeyUsageFlags {
 
 /// Basic Constraints extension (OID 2.5.29.19)
 #[derive(Debug, Clone, Default)]
-pub struct BasicConstraints {
+pub(crate) struct BasicConstraints {
     /// Whether this certificate is a CA
     pub ca: bool,
     /// Maximum number of intermediate certificates allowed below this CA
@@ -42,7 +42,7 @@ pub struct BasicConstraints {
 /// Extract Key Usage extension from a certificate (OID 2.5.29.15)
 ///
 /// Returns None if the extension is not present.
-pub fn extract_key_usage(cert: &Certificate) -> Option<KeyUsageFlags> {
+pub(crate) fn extract_key_usage(cert: &Certificate) -> Option<KeyUsageFlags> {
     let extensions = cert.tbs_certificate.extensions.as_ref()?;
 
     for ext in extensions.iter() {
@@ -74,7 +74,7 @@ pub fn extract_key_usage(cert: &Certificate) -> Option<KeyUsageFlags> {
 /// Extract Basic Constraints extension from a certificate (OID 2.5.29.19)
 ///
 /// Returns None if the extension is not present.
-pub fn extract_basic_constraints(cert: &Certificate) -> Option<BasicConstraints> {
+pub(crate) fn extract_basic_constraints(cert: &Certificate) -> Option<BasicConstraints> {
     let extensions = cert.tbs_certificate.extensions.as_ref()?;
 
     for ext in extensions.iter() {
@@ -135,7 +135,7 @@ pub fn extract_basic_constraints(cert: &Certificate) -> Option<BasicConstraints>
 }
 
 /// Maximum allowed certificate chain depth (to prevent DoS)
-pub const MAX_CHAIN_DEPTH: usize = 10;
+pub(crate) const MAX_CHAIN_DEPTH: usize = 10;
 
 /// PEM certificate begin marker
 const PEM_CERT_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
@@ -150,7 +150,7 @@ const PEM_CERT_END: &str = "-----END CERTIFICATE-----";
 /// - Exact BEGIN/END markers (not just "contains")
 /// - No non-whitespace data between certificates
 /// - Valid base64 content within certificate blocks
-pub fn parse_cert_chain_pem(pem: &str) -> Result<Vec<Certificate>, VerifyError> {
+pub(crate) fn parse_cert_chain_pem(pem: &str) -> Result<Vec<Certificate>, VerifyError> {
     let mut certs = Vec::new();
     let mut current_cert = String::new();
     let mut in_cert = false;
@@ -231,7 +231,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, VerifyError> {
 /// Extract raw public key bytes from an X.509 certificate
 ///
 /// Returns the SubjectPublicKeyInfo's bit string contents
-pub fn extract_public_key(cert: &Certificate) -> Result<Vec<u8>, VerifyError> {
+pub(crate) fn extract_public_key(cert: &Certificate) -> Result<Vec<u8>, VerifyError> {
     let spki = &cert.tbs_certificate.subject_public_key_info;
     let pubkey_bits = spki
         .subject_public_key
@@ -241,13 +241,13 @@ pub fn extract_public_key(cert: &Certificate) -> Result<Vec<u8>, VerifyError> {
 }
 
 /// Compute SHA-256 hash of public key
-pub fn hash_public_key(pubkey_bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn hash_public_key(pubkey_bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(pubkey_bytes).into()
 }
 
 /// Result of certificate chain validation
 #[derive(Debug)]
-pub struct ChainValidationResult {
+pub(crate) struct ChainValidationResult {
     /// SHA-256 hash of the root CA's public key
     pub root_pubkey_hash: [u8; 32],
 }
@@ -281,7 +281,7 @@ pub struct ChainValidationResult {
 /// - Each certificate's Issuer must match its parent's Subject
 ///
 /// Chain should be leaf-first, root-last.
-pub fn validate_tpm_cert_chain(
+pub(crate) fn validate_tpm_cert_chain(
     chain: &[Certificate],
     time: UnixTime,
 ) -> Result<ChainValidationResult, VerifyError> {
@@ -482,18 +482,6 @@ pub fn validate_tpm_cert_chain(
     Ok(ChainValidationResult {
         root_pubkey_hash: root_hash,
     })
-}
-
-/// Parse PEM and validate TPM certificate chain
-///
-/// Convenience wrapper that parses PEM then validates without EKU checking.
-/// Chain should be leaf-first, root-last in the PEM.
-pub fn parse_and_validate_tpm_cert_chain(
-    chain_pem: &str,
-    time: UnixTime,
-) -> Result<ChainValidationResult, VerifyError> {
-    let certs = parse_cert_chain_pem(chain_pem)?;
-    validate_tpm_cert_chain(&certs, time)
 }
 
 #[cfg(test)]

@@ -10,11 +10,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use der::Decode;
 use vaportpm_verify::{
     verify_attestation_output, verify_decoded_attestation_output, CertificateParseReason,
     ChainValidationReason, CloudProvider, DecodedAttestationOutput, DecodedPlatformAttestation,
-    EccPublicKeyCoords, InvalidAttestReason, SignatureInvalidReason, UnixTime, VerifyError,
+    EccPublicKeyCoords, InvalidAttestReason, P256PublicKey, PcrAlgorithm, SignatureInvalidReason,
+    UnixTime, VerifyError,
 };
 
 use vaportpm_verify::AttestationOutput;
@@ -64,7 +64,7 @@ fn test_gcp_amd_fixture_verifies() {
         hex::decode("8a543108a653b4a1162232744cc9b945017a449dea4fbb0ca62f42d3ef145562").unwrap();
     assert_eq!(result.nonce.as_slice(), expected_nonce.as_slice());
 
-    assert!(!result.pcrs.is_empty());
+    assert_eq!(result.pcrs.algorithm(), PcrAlgorithm::Sha256);
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn test_gcp_tdx_fixture_verifies() {
         hex::decode("6424632e79ec068f2189adf46d121b9a10f758c45a18c52f630da14600d4317b").unwrap();
     assert_eq!(result.nonce.as_slice(), expected_nonce.as_slice());
 
-    assert!(!result.pcrs.is_empty());
+    assert_eq!(result.pcrs.algorithm(), PcrAlgorithm::Sha256);
 }
 
 // =============================================================================
@@ -243,20 +243,20 @@ fn test_gcp_reject_tampered_nonce_correct_length() {
 /// GCP verification explicitly requires SHA-256 PCRs and rejects
 /// any non-SHA-256 bank.
 ///
-/// Detected at: gcp.rs — non-SHA-256 PCR rejection
+/// Detected at: gcp.rs — WrongPcrBankAlgorithm check
 #[test]
 fn test_gcp_reject_non_sha256_pcrs() {
     let mut output = load_gcp_amd_fixture();
 
-    // Remove the SHA-256 bank entirely, substitute a SHA-384 entry
-    // so that decode() doesn't fail on empty PCRs
+    // Remove the SHA-256 bank entirely, substitute 24 SHA-384 entries
+    // so that PcrBank::from_btree_map succeeds. GCP then rejects it
+    // with WrongPcrBankAlgorithm.
     output.pcrs.remove("sha256");
     let mut sha384_pcrs = BTreeMap::new();
-    sha384_pcrs.insert(
-        0u8,
-        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
-            .to_string(),
-    );
+    let sha384_zero = "0".repeat(96); // 48 bytes = 96 hex chars
+    for idx in 0u8..24 {
+        sha384_pcrs.insert(idx, sha384_zero.clone());
+    }
     output.pcrs.insert("sha384".to_string(), sha384_pcrs);
 
     let result = verify_attestation_output(&output, gcp_amd_fixture_time());
@@ -264,7 +264,10 @@ fn test_gcp_reject_non_sha256_pcrs() {
         matches!(
             result,
             Err(VerifyError::InvalidAttest(
-                InvalidAttestReason::UnexpectedPcrAlgorithmGcp { .. }
+                InvalidAttestReason::WrongPcrBankAlgorithm {
+                    expected: PcrAlgorithm::Sha256,
+                    got: PcrAlgorithm::Sha384,
+                }
             ))
         ),
         "Should reject attestation with non-SHA-256 PCRs, got: {:?}",
@@ -278,13 +281,13 @@ fn test_gcp_reject_non_sha256_pcrs() {
 
 /// Removing a PCR from the attestation when all 24 are required.
 ///
-/// Detected at: gcp.rs — "all 24 PCRs (0-23) are required"
+/// Detected at: PcrBank::from_btree_map — rejects incomplete PCR sets
 #[test]
 fn test_gcp_reject_missing_pcr() {
     let mut output = load_gcp_amd_fixture();
 
-    // Remove PCR 0 — this now hits the "all 24 required" check before
-    // reaching the Quote-level pcr_select check.
+    // Remove PCR 0 — hits PcrBankWrongCount at decode time
+    // (23 entries instead of 24)
     if let Some(sha256_pcrs) = output.pcrs.get_mut("sha256") {
         sha256_pcrs.remove(&0u8);
     }
@@ -294,7 +297,10 @@ fn test_gcp_reject_missing_pcr() {
         matches!(
             result,
             Err(VerifyError::InvalidAttest(
-                InvalidAttestReason::MissingPcr { .. }
+                InvalidAttestReason::PcrBankWrongCount {
+                    expected: 24,
+                    got: 23
+                }
             ))
         ),
         "Should reject when a PCR is missing, got: {:?}",
@@ -492,13 +498,13 @@ fn test_gcp_decoded_reject_unknown_root_ca() {
     // Start from the real fixture (has valid quote_attest, nonce, PCRs)
     let mut decoded = decode_gcp_amd_fixture();
 
-    // Extract AK public key from the fake leaf cert
-    let leaf_x509 =
-        x509_cert::Certificate::from_der(leaf_cert.der()).expect("generated cert should parse");
-    let ak_pubkey_vec = vaportpm_verify::extract_public_key(&leaf_x509).unwrap();
-    let mut ak_pubkey = [0u8; 65];
-    ak_pubkey.copy_from_slice(&ak_pubkey_vec);
-    decoded.ak_pubkey = ak_pubkey;
+    // Extract AK public key from the leaf signing key
+    let leaf_signing_key_for_pk =
+        p256::ecdsa::SigningKey::from_pkcs8_der(&leaf_key.serialize_der()).unwrap();
+    let ak_point = leaf_signing_key_for_pk
+        .verifying_key()
+        .to_encoded_point(false);
+    decoded.ak_pubkey = P256PublicKey::from_sec1_uncompressed(ak_point.as_bytes()).unwrap();
 
     // Re-sign the quote_attest with the fake leaf's private key so the
     // signature verification passes. verify_ecdsa_p256 does

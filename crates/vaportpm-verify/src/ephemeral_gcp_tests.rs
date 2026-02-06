@@ -9,6 +9,7 @@
 use crate::error::{
     ChainValidationReason, InvalidAttestReason, SignatureInvalidReason, VerifyError,
 };
+use crate::pcr::{P256PublicKey, PcrAlgorithm};
 use crate::roots::register_test_root;
 use crate::test_support;
 use crate::{
@@ -41,8 +42,8 @@ fn test_ephemeral_gcp_reject_multiple_pcr_banks() {
     let pcr_digest = test_support::compute_pcr_digest(&pcrs);
     // TWO banks in pcr_select
     let pcr_select = vec![
-        (0x000Bu16, vec![0xFF, 0xFF, 0xFF]),
-        (0x000Cu16, vec![0xFF, 0xFF, 0xFF]),
+        (PcrAlgorithm::Sha256 as u16, vec![0xFF, 0xFF, 0xFF]),
+        (PcrAlgorithm::Sha384 as u16, vec![0xFF, 0xFF, 0xFF]),
     ];
     let quote_attest = test_support::build_tpm_quote_attest(&nonce, &pcr_select, &pcr_digest);
     let quote_sig = test_support::sign_tpm_quote(&quote_attest, &chain.ak_signing_key);
@@ -81,8 +82,8 @@ fn test_ephemeral_gcp_reject_wrong_pcr_algorithm() {
     let guard = register_test_root(chain.root_pubkey_hash, CloudProvider::Gcp);
 
     let pcr_digest = test_support::compute_pcr_digest(&pcrs);
-    // SHA-384 (0x000C) instead of SHA-256 (0x000B)
-    let pcr_select = vec![(0x000Cu16, vec![0xFF, 0xFF, 0xFF])];
+    // SHA-384 instead of SHA-256
+    let pcr_select = vec![(PcrAlgorithm::Sha384 as u16, vec![0xFF, 0xFF, 0xFF])];
     let quote_attest = test_support::build_tpm_quote_attest(&nonce, &pcr_select, &pcr_digest);
     let quote_sig = test_support::sign_tpm_quote(&quote_attest, &chain.ak_signing_key);
 
@@ -104,7 +105,7 @@ fn test_ephemeral_gcp_reject_wrong_pcr_algorithm() {
             result,
             Err(VerifyError::InvalidAttest(
                 InvalidAttestReason::WrongPcrAlgorithm {
-                    expected: 0x000B,
+                    expected: PcrAlgorithm::Sha256,
                     got: 0x000C,
                 }
             ))
@@ -143,7 +144,10 @@ fn test_ephemeral_gcp_reject_ak_pubkey_mismatch() {
     let (mut decoded, time, _guard) = test_support::build_valid_gcp(&nonce, &pcrs);
 
     // Change the AK pubkey — doesn't match the leaf cert
-    decoded.ak_pubkey = [0x04; 65];
+    decoded.ak_pubkey = P256PublicKey {
+        x: [0x04; 32],
+        y: [0x04; 32],
+    };
 
     let result = verify_decoded_attestation_output(&decoded, time);
     assert!(
@@ -159,49 +163,28 @@ fn test_ephemeral_gcp_reject_ak_pubkey_mismatch() {
 }
 
 #[test]
-fn test_ephemeral_gcp_reject_empty_pcrs() {
+fn test_ephemeral_gcp_reject_wrong_pcr_bank_algorithm() {
+    // Construct a valid Nitro (SHA-384) PcrBank and pass it to GCP verification
+    // This should be rejected by the algorithm check.
     let nonce = [0xBB; 32];
-    let pcrs = test_support::make_gcp_pcrs();
-    let (mut decoded, time, _guard) = test_support::build_valid_gcp(&nonce, &pcrs);
+    let wrong_pcrs = test_support::make_nitro_pcrs(); // SHA-384
+    let gcp_pcrs = test_support::make_gcp_pcrs(); // SHA-256
 
-    // Clear all PCRs
-    decoded.pcrs.clear();
+    let (mut decoded, time, _guard) = test_support::build_valid_gcp(&nonce, &gcp_pcrs);
+    decoded.pcrs = wrong_pcrs;
 
     let result = verify_decoded_attestation_output(&decoded, time);
     assert!(
         matches!(
             result,
             Err(VerifyError::InvalidAttest(
-                InvalidAttestReason::MissingSha256Pcrs
+                InvalidAttestReason::WrongPcrBankAlgorithm {
+                    expected: PcrAlgorithm::Sha256,
+                    got: PcrAlgorithm::Sha384,
+                }
             ))
         ),
-        "Expected MissingSha256Pcrs error, got: {:?}",
-        result
-    );
-}
-
-#[test]
-fn test_ephemeral_gcp_reject_pcr_index_out_of_range() {
-    let nonce = [0xBB; 32];
-    let mut pcrs = test_support::make_gcp_pcrs();
-    // Add an extra PCR with index 24 (out of range)
-    pcrs.insert((0, 24), vec![0xAA; 32]);
-
-    let (mut decoded, time, _guard) =
-        test_support::build_valid_gcp(&nonce, &test_support::make_gcp_pcrs());
-
-    // Replace PCRs with our set that includes the out-of-range index
-    decoded.pcrs = pcrs;
-
-    let result = verify_decoded_attestation_output(&decoded, time);
-    assert!(
-        matches!(
-            result,
-            Err(VerifyError::InvalidAttest(
-                InvalidAttestReason::PcrIndexOutOfRange { index: 24 }
-            ))
-        ),
-        "Expected PcrIndexOutOfRange error, got: {:?}",
+        "Expected WrongPcrBankAlgorithm error, got: {:?}",
         result
     );
 }
@@ -216,7 +199,7 @@ fn test_ephemeral_gcp_reject_partial_pcr_bitmap() {
 
     let pcr_digest = test_support::compute_pcr_digest(&pcrs);
     // Correct algorithm but partial bitmap — only first 16 PCRs selected
-    let pcr_select = vec![(0x000Bu16, vec![0xFF, 0xFF, 0x00])];
+    let pcr_select = vec![(PcrAlgorithm::Sha256 as u16, vec![0xFF, 0xFF, 0x00])];
     let quote_attest = test_support::build_tpm_quote_attest(&nonce, &pcr_select, &pcr_digest);
     let quote_sig = test_support::sign_tpm_quote(&quote_attest, &chain.ak_signing_key);
 
@@ -258,7 +241,7 @@ fn test_ephemeral_gcp_reject_wrong_provider_root() {
     let guard = register_test_root(chain.root_pubkey_hash, CloudProvider::Aws);
 
     let pcr_digest = test_support::compute_pcr_digest(&pcrs);
-    let pcr_select = vec![(0x000Bu16, vec![0xFF, 0xFF, 0xFF])];
+    let pcr_select = vec![(PcrAlgorithm::Sha256 as u16, vec![0xFF, 0xFF, 0xFF])];
     let quote_attest = test_support::build_tpm_quote_attest(&nonce, &pcr_select, &pcr_digest);
     let quote_sig = test_support::sign_tpm_quote(&quote_attest, &chain.ak_signing_key);
 

@@ -12,7 +12,6 @@ vaportpm-attest = { path = "../../../../crates/vaportpm-attest" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 hex = "0.4"
-serde-big-array = "0.5"
 sha2 = "0.10"
 rsa = "=0.9.9"  # Force version for risczero patch
 pki-types = { package = "rustls-pki-types", version = "1.13" }
