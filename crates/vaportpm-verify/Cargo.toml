@@ -36,6 +36,9 @@ serde_json = { workspace = true }
 serde-big-array = { workspace = true }
 zerocopy = { workspace = true }
 
+[dev-dependencies]
+rcgen = "0.13"
+
 [lib]
 name = "vaportpm_verify"
 path = "src/lib.rs"

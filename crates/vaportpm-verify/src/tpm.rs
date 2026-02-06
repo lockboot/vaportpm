@@ -6,6 +6,8 @@ use ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use sha2::{Digest, Sha256};
 
+use std::collections::BTreeMap;
+
 use crate::error::VerifyError;
 
 /// Verify ECDSA-SHA256 signature over a message
@@ -221,6 +223,60 @@ impl<'a> SafeCursor<'a> {
 
         Ok(selections)
     }
+}
+
+/// Verify that the PCR digest in a Quote matches the claimed PCR values
+///
+/// The TPM Quote contains a PCR selection (which banks/indices were quoted)
+/// and a digest over those PCR values. This function recomputes the digest
+/// from the claimed PCR values and compares it to the signed digest.
+///
+/// Supports multiple PCR banks:
+/// - TPM_ALG_SHA256 (0x000B) → decoded algorithm ID 0
+/// - TPM_ALG_SHA384 (0x000C) → decoded algorithm ID 1
+pub fn verify_pcr_digest_matches(
+    quote_info: &TpmQuoteInfo,
+    pcrs: &BTreeMap<(u8, u8), Vec<u8>>,
+) -> Result<(), VerifyError> {
+    // The PCR digest is SHA-256(concatenation of selected PCR values in order)
+    // The selection order is determined by the pcr_select field
+    let mut hasher = Sha256::new();
+
+    for (alg, bitmap) in &quote_info.pcr_select {
+        let decoded_alg_id = match *alg {
+            0x000B => 0u8, // TPM_ALG_SHA256
+            0x000C => 1u8, // TPM_ALG_SHA384
+            _ => continue,
+        };
+
+        // Iterate through bitmap to find selected PCRs
+        for (byte_idx, byte_val) in bitmap.iter().enumerate() {
+            for bit_idx in 0..8 {
+                if byte_val & (1 << bit_idx) != 0 {
+                    let pcr_idx = (byte_idx * 8 + bit_idx) as u8;
+                    if let Some(pcr_value) = pcrs.get(&(decoded_alg_id, pcr_idx)) {
+                        hasher.update(pcr_value);
+                    } else {
+                        return Err(VerifyError::InvalidAttest(format!(
+                            "PCR {} (alg 0x{:04X}) selected in Quote but not present in attestation",
+                            pcr_idx, alg
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    let computed_digest = hasher.finalize();
+    if computed_digest.as_ref() != quote_info.pcr_digest {
+        return Err(VerifyError::InvalidAttest(format!(
+            "PCR digest mismatch. Quote digest: {}, Computed from PCRs: {}",
+            hex::encode(&quote_info.pcr_digest),
+            hex::encode(computed_digest)
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

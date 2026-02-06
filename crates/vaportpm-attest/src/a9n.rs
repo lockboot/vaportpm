@@ -175,7 +175,9 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
         attest_gcp(&mut tpm, nonce, &pcr_values, pcr_alg)?
     } else if is_nitro {
         // Nitro path: create long-term AK, use TPM2_Quote
-        attest_nitro(&mut tpm, nonce, &pcr_values, pcr_alg)?
+        // SHA-384 is hardcoded — the Quote must attest the same PCR bank that
+        // the Nitro NSM document signs, so they can be cross-verified.
+        attest_nitro(&mut tpm, nonce, &pcr_values)?
     } else {
         return Err(anyhow!(
             "Unknown platform - only AWS Nitro and GCP Shielded VM are supported"
@@ -236,12 +238,11 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
 ///
 /// Creates a TCG-compliant restricted AK in the endorsement hierarchy, then uses
 /// TPM2_Quote to sign the PCR values. The AK is bound to the Nitro NSM document.
-fn attest_nitro(
-    tpm: &mut Tpm,
-    nonce: &[u8],
-    pcr_values: &[(u8, Vec<u8>)],
-    pcr_alg: crate::TpmAlg,
-) -> Result<AttestResult> {
+///
+/// The Quote always uses SHA-384 PCR selection because the Nitro NSM document
+/// signs SHA-384 PCR values. Using the same bank ensures the TPM Quote's PCR
+/// digest can be cross-verified against the Nitro-signed values.
+fn attest_nitro(tpm: &mut Tpm, nonce: &[u8], pcr_values: &[(u8, Vec<u8>)]) -> Result<AttestResult> {
     // Create restricted AK in endorsement hierarchy (TCG-compliant AK profile)
     // Trust comes from Nitro NSM document binding the AK public key
     let signing_key = tpm.create_restricted_ak(TPM_RH_ENDORSEMENT)?;
@@ -255,9 +256,11 @@ fn attest_nitro(
         },
     );
 
-    // Build PCR selection bitmap for Quote
+    // Build PCR selection bitmap for Quote — always SHA-384 for Nitro
+    // The TPM Quote must attest the same PCR bank that the Nitro NSM
+    // document signs, so the verification side can cross-check them.
     let pcr_bitmap = build_pcr_bitmap(pcr_values);
-    let pcr_selection = vec![(pcr_alg, pcr_bitmap.as_slice())];
+    let pcr_selection = vec![(crate::TpmAlg::Sha384, pcr_bitmap.as_slice())];
 
     // Perform TPM2_Quote - signs PCR values with AK
     let quote_result = tpm.quote(signing_key.handle, nonce, &pcr_selection)?;

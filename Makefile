@@ -1,4 +1,4 @@
-.PHONY: all build release-x86 check test fmt fmt-check clippy doc clean ci
+.PHONY: all build release-x86 check test fmt fmt-check clippy doc clean ci coverage setup-coverage
 
 all: build
 
@@ -33,6 +33,17 @@ clean:
 	cargo clean
 
 ci: fmt-check check clippy test doc
+
+setup-coverage:
+	rustup component add llvm-tools-preview
+	cargo install cargo-llvm-cov
+
+coverage-html:
+	cargo llvm-cov -p vaportpm-verify --html
+	@echo "Coverage report: target/llvm-cov/html/index.html"
+
+coverage-text:
+	cargo llvm-cov -p vaportpm-verify
 
 rustup:
 	rustup default stable

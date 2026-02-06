@@ -24,7 +24,7 @@ use serde_big_array::BigArray;
 pub use error::VerifyError;
 
 // Re-export TPM types and functions (only those used by verification paths)
-pub use tpm::{parse_quote_attest, verify_ecdsa_p256, TpmQuoteInfo};
+pub use tpm::{parse_quote_attest, verify_ecdsa_p256, verify_pcr_digest_matches, TpmQuoteInfo};
 
 // Re-export from vaportpm_attest
 pub use vaportpm_attest::TpmAlg;
@@ -285,58 +285,6 @@ pub fn verify_attestation_json(json: &str) -> Result<VerificationResult, VerifyE
 mod tests {
     use super::*;
 
-    // Timestamp for Nitro test fixture (Feb 3, 2026 11:00:00 UTC - within cert validity window)
-    const NITRO_FIXTURE_TIMESTAMP_SECS: u64 = 1770116400;
-
-    // Timestamp for GCP test fixture (Feb 2, 2026 when certificates are valid)
-    const GCP_FIXTURE_TIMESTAMP_SECS: u64 = 1770019200; // Feb 2, 2026 08:00:00 UTC
-
-    fn nitro_fixture_time() -> UnixTime {
-        UnixTime::since_unix_epoch(std::time::Duration::from_secs(NITRO_FIXTURE_TIMESTAMP_SECS))
-    }
-
-    fn gcp_fixture_time() -> UnixTime {
-        UnixTime::since_unix_epoch(std::time::Duration::from_secs(GCP_FIXTURE_TIMESTAMP_SECS))
-    }
-
-    #[test]
-    fn test_verify_nitro_fixture() {
-        let fixture = include_str!("../test-nitro-fixture.json");
-        let output: AttestationOutput =
-            serde_json::from_str(fixture).expect("Failed to parse test-nitro-fixture.json");
-
-        let result = verify_attestation_output(&output, nitro_fixture_time())
-            .expect("Verification should succeed");
-
-        // Should be AWS (Nitro)
-        assert_eq!(result.provider, CloudProvider::Aws);
-
-        // Nonce should be 32 bytes
-        assert_eq!(result.nonce.len(), 32);
-    }
-
-    #[test]
-    fn test_verify_gcp_amd_fixture() {
-        let fixture = include_str!("../test-gcp-amd-fixture.json");
-        let output: AttestationOutput =
-            serde_json::from_str(fixture).expect("Failed to parse test-gcp-fixture.json");
-
-        let result = verify_attestation_output(&output, gcp_fixture_time())
-            .expect("Verification should succeed");
-
-        // Should be GCP
-        assert_eq!(result.provider, CloudProvider::Gcp);
-
-        // Should have the nonce from the Quote (binary)
-        let expected_nonce =
-            hex::decode("8a543108a653b4a1162232744cc9b945017a449dea4fbb0ca62f42d3ef145562")
-                .unwrap();
-        assert_eq!(result.nonce.as_slice(), expected_nonce.as_slice());
-
-        // Should have PCR values
-        assert!(!result.pcrs.is_empty());
-    }
-
     #[test]
     fn test_reject_empty_attestation() {
         let output = AttestationOutput {
@@ -356,108 +304,5 @@ mod tests {
             result.is_err(),
             "Should reject attestation with missing components"
         );
-    }
-
-    /// Test that tampering with the AK public key field is detected
-    #[test]
-    fn test_reject_tampered_nitro_public_key() {
-        let fixture = include_str!("../test-nitro-fixture.json");
-        let mut output: AttestationOutput =
-            serde_json::from_str(fixture).expect("Failed to parse test-nitro-fixture.json");
-
-        // Tamper with the AK public key (attacker tries to substitute their own key)
-        // This should fail because it won't match the signed value in Nitro document
-        output.ak_pubkeys.insert(
-            "ecc_p256".to_string(),
-            EccPublicKeyCoords {
-                x: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                y: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
-            },
-        );
-
-        let result = verify_attestation_output(&output, nitro_fixture_time());
-        assert!(
-            matches!(result, Err(VerifyError::SignatureInvalid(_))),
-            "Should reject tampered public_key field, got: {:?}",
-            result
-        );
-    }
-
-    /// Test that tampering with the top-level nonce field is detected
-    #[test]
-    fn test_reject_tampered_nitro_nonce() {
-        let fixture = include_str!("../test-nitro-fixture.json");
-        let mut output: AttestationOutput =
-            serde_json::from_str(fixture).expect("Failed to parse test-nitro-fixture.json");
-
-        // Tamper with the top-level nonce
-        output.nonce = "deadbeef".to_string();
-
-        let result = verify_attestation_output(&output, nitro_fixture_time());
-        assert!(
-            matches!(result, Err(VerifyError::InvalidAttest(_))),
-            "Should reject tampered nonce field, got: {:?}",
-            result
-        );
-    }
-
-    /// Test that tampering with SHA-384 PCR values is detected
-    #[test]
-    fn test_reject_tampered_pcr_values() {
-        let fixture = include_str!("../test-nitro-fixture.json");
-        let mut output: AttestationOutput =
-            serde_json::from_str(fixture).expect("Failed to parse test-nitro-fixture.json");
-
-        // Tamper with a SHA-384 PCR value
-        if let Some(sha384_pcrs) = output.pcrs.get_mut("sha384") {
-            sha384_pcrs.insert(
-                0,
-                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()
-            );
-        }
-
-        let result = verify_attestation_output(&output, nitro_fixture_time());
-        // Tampering is detected: claimed PCR values don't match signed values in Nitro document
-        assert!(
-            matches!(result, Err(VerifyError::SignatureInvalid(_))),
-            "Should reject tampered PCR values, got: {:?}",
-            result
-        );
-    }
-}
-
-#[cfg(test)]
-mod tdx_tests {
-    use super::*;
-
-    // Timestamp for GCP TDX test fixture (Feb 3, 2026 when certificates are valid)
-    const GCP_TDX_FIXTURE_TIMESTAMP_SECS: u64 = 1770091200; // Feb 3, 2026 08:00:00 UTC
-
-    fn gcp_tdx_fixture_time() -> UnixTime {
-        UnixTime::since_unix_epoch(std::time::Duration::from_secs(
-            GCP_TDX_FIXTURE_TIMESTAMP_SECS,
-        ))
-    }
-
-    #[test]
-    fn test_verify_gcp_tdx_fixture() {
-        let fixture = include_str!("../test-gcp-tdx-fixture.json");
-        let output: AttestationOutput =
-            serde_json::from_str(fixture).expect("Failed to parse test-gcp-tdx-fixture.json");
-
-        let result = verify_attestation_output(&output, gcp_tdx_fixture_time())
-            .expect("Verification should succeed");
-
-        // Should be GCP
-        assert_eq!(result.provider, CloudProvider::Gcp);
-
-        // Should have the nonce from the Quote (binary)
-        let expected_nonce =
-            hex::decode("6424632e79ec068f2189adf46d121b9a10f758c45a18c52f630da14600d4317b")
-                .unwrap();
-        assert_eq!(result.nonce.as_slice(), expected_nonce.as_slice());
-
-        // Should have PCR values
-        assert!(!result.pcrs.is_empty());
     }
 }
