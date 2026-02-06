@@ -2,8 +2,6 @@
 
 //! Validated PCR bank type and supporting types.
 
-use std::collections::BTreeMap;
-
 use crate::error::{InvalidAttestReason, VerifyError};
 
 /// Number of PCRs in a complete bank.
@@ -43,8 +41,8 @@ impl TryFrom<u16> for PcrAlgorithm {
 impl std::fmt::Display for PcrAlgorithm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PcrAlgorithm::Sha256 => write!(f, "SHA-256"),
-            PcrAlgorithm::Sha384 => write!(f, "SHA-384"),
+            PcrAlgorithm::Sha256 => write!(f, "sha256"),
+            PcrAlgorithm::Sha384 => write!(f, "sha384"),
         }
     }
 }
@@ -63,71 +61,87 @@ pub enum PcrBank {
 }
 
 impl PcrBank {
-    /// Construct from a `BTreeMap<(u16, u8), Vec<u8>>` keyed by `(tpm_alg_id, pcr_index)`.
+    /// Construct from an algorithm and indexed PCR values.
     ///
-    /// Validates: single algorithm, all 24 indices present, correct value lengths.
-    pub fn from_btree_map(pcrs: &BTreeMap<(u16, u8), Vec<u8>>) -> Result<Self, VerifyError> {
-        if pcrs.is_empty() {
-            return Err(InvalidAttestReason::PcrBankEmpty.into());
-        }
+    /// Validates: all 24 indices (0-23) present, correct value lengths for the algorithm.
+    pub fn from_values<V: AsRef<[u8]>>(
+        algorithm: PcrAlgorithm,
+        values: impl IntoIterator<Item = (u8, V)>,
+    ) -> Result<Self, VerifyError> {
+        let digest_len = algorithm.digest_len();
 
-        // Determine the single algorithm
-        let first_alg = pcrs.keys().next().unwrap().0;
-        for (alg_id, _) in pcrs.keys() {
-            if *alg_id != first_alg {
-                return Err(InvalidAttestReason::PcrBankMixedAlgorithms.into());
+        // Validate and collect into a flat buffer
+        let mut flat = vec![0u8; PCR_COUNT * digest_len];
+        let mut seen = [false; PCR_COUNT];
+        for (idx, value) in values {
+            let value = value.as_ref();
+            if (idx as usize) < PCR_COUNT {
+                if value.len() != digest_len {
+                    return Err(InvalidAttestReason::PcrValueWrongLength {
+                        index: idx,
+                        expected: digest_len,
+                        got: value.len(),
+                    }
+                    .into());
+                }
+                let offset = idx as usize * digest_len;
+                flat[offset..offset + digest_len].copy_from_slice(value);
+                seen[idx as usize] = true;
+            }
+        }
+        for idx in 0..PCR_COUNT as u8 {
+            if !seen[idx as usize] {
+                return Err(InvalidAttestReason::MissingPcr { index: idx }.into());
             }
         }
 
-        let algorithm = PcrAlgorithm::try_from(first_alg)
-            .map_err(|alg_id| InvalidAttestReason::UnknownPcrAlgorithm { alg_id })?;
+        // Copy into correctly-typed arrays
+        match algorithm {
+            PcrAlgorithm::Sha256 => {
+                let mut bank = [[0u8; 32]; PCR_COUNT];
+                for i in 0..PCR_COUNT {
+                    bank[i].copy_from_slice(&flat[i * 32..(i + 1) * 32]);
+                }
+                Ok(PcrBank::Sha256(bank))
+            }
+            PcrAlgorithm::Sha384 => {
+                let mut bank = [[0u8; 48]; PCR_COUNT];
+                for i in 0..PCR_COUNT {
+                    bank[i].copy_from_slice(&flat[i * 48..(i + 1) * 48]);
+                }
+                Ok(PcrBank::Sha384(bank))
+            }
+        }
+    }
 
-        // Check count
-        if pcrs.len() != PCR_COUNT {
-            return Err(InvalidAttestReason::PcrBankWrongCount {
-                expected: PCR_COUNT,
-                got: pcrs.len(),
+    /// Construct from a contiguous buffer of PCR values in index order.
+    ///
+    /// `data` must be exactly `PCR_COUNT * algorithm.digest_len()` bytes,
+    /// containing values for PCRs 0-23 packed sequentially.
+    pub fn from_contiguous(algorithm: PcrAlgorithm, data: &[u8]) -> Result<Self, VerifyError> {
+        let digest_len = algorithm.digest_len();
+        let expected_len = PCR_COUNT * digest_len;
+        if data.len() != expected_len {
+            return Err(InvalidAttestReason::InputTooShort {
+                actual: data.len(),
+                minimum: expected_len,
             }
             .into());
         }
-
-        let alg_key = algorithm as u16;
         match algorithm {
             PcrAlgorithm::Sha256 => {
-                let mut values = [[0u8; 32]; PCR_COUNT];
-                for idx in 0..PCR_COUNT as u8 {
-                    let value = pcrs
-                        .get(&(alg_key, idx))
-                        .ok_or(InvalidAttestReason::MissingPcr { index: idx })?;
-                    if value.len() != 32 {
-                        return Err(InvalidAttestReason::PcrValueWrongLength {
-                            index: idx,
-                            expected: 32,
-                            got: value.len(),
-                        }
-                        .into());
-                    }
-                    values[idx as usize].copy_from_slice(value);
+                let mut bank = [[0u8; 32]; PCR_COUNT];
+                for i in 0..PCR_COUNT {
+                    bank[i].copy_from_slice(&data[i * 32..(i + 1) * 32]);
                 }
-                Ok(PcrBank::Sha256(values))
+                Ok(PcrBank::Sha256(bank))
             }
             PcrAlgorithm::Sha384 => {
-                let mut values = [[0u8; 48]; PCR_COUNT];
-                for idx in 0..PCR_COUNT as u8 {
-                    let value = pcrs
-                        .get(&(alg_key, idx))
-                        .ok_or(InvalidAttestReason::MissingPcr { index: idx })?;
-                    if value.len() != 48 {
-                        return Err(InvalidAttestReason::PcrValueWrongLength {
-                            index: idx,
-                            expected: 48,
-                            got: value.len(),
-                        }
-                        .into());
-                    }
-                    values[idx as usize].copy_from_slice(value);
+                let mut bank = [[0u8; 48]; PCR_COUNT];
+                for i in 0..PCR_COUNT {
+                    bank[i].copy_from_slice(&data[i * 48..(i + 1) * 48]);
                 }
-                Ok(PcrBank::Sha384(values))
+                Ok(PcrBank::Sha384(bank))
             }
         }
     }
@@ -151,16 +165,6 @@ impl PcrBank {
     /// Iterate all 24 PCR values in index order as `&[u8]` slices.
     pub fn values(&self) -> PcrIter<'_> {
         PcrIter { bank: self, idx: 0 }
-    }
-
-    /// Convert back to `BTreeMap<(u16, u8), Vec<u8>>` keyed by `(tpm_alg_id, pcr_index)`.
-    pub fn to_btree_map(&self) -> BTreeMap<(u16, u8), Vec<u8>> {
-        let alg_key = self.algorithm() as u16;
-        let mut map = BTreeMap::new();
-        for idx in 0..PCR_COUNT {
-            map.insert((alg_key, idx as u8), self.get(idx).to_vec());
-        }
-        map
     }
 }
 
@@ -236,26 +240,10 @@ impl P256PublicKey {
 mod tests {
     use super::*;
 
-    fn make_sha256_btree() -> BTreeMap<(u16, u8), Vec<u8>> {
-        let mut m = BTreeMap::new();
-        for idx in 0..24u8 {
-            m.insert((PcrAlgorithm::Sha256 as u16, idx), vec![idx; 32]);
-        }
-        m
-    }
-
-    fn make_sha384_btree() -> BTreeMap<(u16, u8), Vec<u8>> {
-        let mut m = BTreeMap::new();
-        for idx in 0..24u8 {
-            m.insert((PcrAlgorithm::Sha384 as u16, idx), vec![idx; 48]);
-        }
-        m
-    }
-
     #[test]
-    fn test_from_btree_map_sha256() {
-        let m = make_sha256_btree();
-        let bank = PcrBank::from_btree_map(&m).unwrap();
+    fn test_from_values_sha256() {
+        let bank = PcrBank::from_values(PcrAlgorithm::Sha256, (0u8..24).map(|i| (i, vec![i; 32])))
+            .unwrap();
         assert_eq!(bank.algorithm(), PcrAlgorithm::Sha256);
         assert_eq!(bank.get(0), &[0u8; 32]);
         assert_eq!(bank.get(23), &[23u8; 32]);
@@ -263,63 +251,37 @@ mod tests {
     }
 
     #[test]
-    fn test_from_btree_map_sha384() {
-        let m = make_sha384_btree();
-        let bank = PcrBank::from_btree_map(&m).unwrap();
+    fn test_from_values_sha384() {
+        let bank = PcrBank::from_values(PcrAlgorithm::Sha384, (0u8..24).map(|i| (i, vec![i; 48])))
+            .unwrap();
         assert_eq!(bank.algorithm(), PcrAlgorithm::Sha384);
         assert_eq!(bank.get(0), &[0u8; 48]);
         assert_eq!(bank.get(23), &[23u8; 48]);
     }
 
     #[test]
-    fn test_reject_empty() {
-        let m = BTreeMap::new();
-        let err = PcrBank::from_btree_map(&m).unwrap_err();
+    fn test_reject_missing_pcr() {
+        // Only 23 values — PCR 23 is missing
+        let err = PcrBank::from_values(PcrAlgorithm::Sha256, (0u8..23).map(|i| (i, vec![i; 32])))
+            .unwrap_err();
         assert!(matches!(
             err,
-            VerifyError::InvalidAttest(InvalidAttestReason::PcrBankEmpty)
-        ));
-    }
-
-    #[test]
-    fn test_reject_mixed_algorithms() {
-        let mut m = BTreeMap::new();
-        for idx in 0..23u8 {
-            m.insert((PcrAlgorithm::Sha256 as u16, idx), vec![idx; 32]);
-        }
-        m.insert((PcrAlgorithm::Sha384 as u16, 23), vec![23; 48]); // wrong algorithm
-        let err = PcrBank::from_btree_map(&m).unwrap_err();
-        assert!(matches!(
-            err,
-            VerifyError::InvalidAttest(InvalidAttestReason::PcrBankMixedAlgorithms)
-        ));
-    }
-
-    #[test]
-    fn test_reject_wrong_count() {
-        let mut m = BTreeMap::new();
-        for idx in 0..23u8 {
-            // only 23
-            m.insert((PcrAlgorithm::Sha256 as u16, idx), vec![idx; 32]);
-        }
-        let err = PcrBank::from_btree_map(&m).unwrap_err();
-        assert!(matches!(
-            err,
-            VerifyError::InvalidAttest(InvalidAttestReason::PcrBankWrongCount { .. })
+            VerifyError::InvalidAttest(InvalidAttestReason::MissingPcr { index: 23 })
         ));
     }
 
     #[test]
     fn test_reject_wrong_value_length() {
-        let mut m = BTreeMap::new();
-        for idx in 0..24u8 {
-            if idx == 5 {
-                m.insert((PcrAlgorithm::Sha256 as u16, idx), vec![idx; 48]); // wrong length for SHA-256
-            } else {
-                m.insert((PcrAlgorithm::Sha256 as u16, idx), vec![idx; 32]);
-            }
-        }
-        let err = PcrBank::from_btree_map(&m).unwrap_err();
+        let values: Vec<(u8, Vec<u8>)> = (0u8..24)
+            .map(|i| {
+                if i == 5 {
+                    (i, vec![i; 48]) // wrong length for SHA-256
+                } else {
+                    (i, vec![i; 32])
+                }
+            })
+            .collect();
+        let err = PcrBank::from_values(PcrAlgorithm::Sha256, values).unwrap_err();
         assert!(matches!(
             err,
             VerifyError::InvalidAttest(InvalidAttestReason::PcrValueWrongLength {
@@ -331,39 +293,17 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_unknown_algorithm() {
-        let mut m = BTreeMap::new();
-        for idx in 0..24u8 {
-            m.insert((0x9999, idx), vec![idx; 32]); // unknown TPM algorithm
-        }
-        let err = PcrBank::from_btree_map(&m).unwrap_err();
-        assert!(matches!(
-            err,
-            VerifyError::InvalidAttest(InvalidAttestReason::UnknownPcrAlgorithm { alg_id: 0x9999 })
-        ));
-    }
-
-    #[test]
     fn test_reject_index_out_of_range() {
-        let mut m = BTreeMap::new();
-        for idx in 0..23u8 {
-            m.insert((PcrAlgorithm::Sha256 as u16, idx), vec![idx; 32]);
-        }
-        m.insert((PcrAlgorithm::Sha256 as u16, 24), vec![24; 32]); // out of range
-                                                                   // This has 24 entries but index 23 is missing and 24 is present
-        let err = PcrBank::from_btree_map(&m).unwrap_err();
+        // Indices 0-22 plus 24 (out of range) — PCR 23 is missing
+        let values: Vec<(u8, Vec<u8>)> = (0u8..23)
+            .chain(std::iter::once(24u8))
+            .map(|i| (i, vec![0u8; 32]))
+            .collect();
+        let err = PcrBank::from_values(PcrAlgorithm::Sha256, values).unwrap_err();
         assert!(matches!(
             err,
             VerifyError::InvalidAttest(InvalidAttestReason::MissingPcr { index: 23 })
         ));
-    }
-
-    #[test]
-    fn test_to_btree_map_roundtrip() {
-        let m = make_sha256_btree();
-        let bank = PcrBank::from_btree_map(&m).unwrap();
-        let m2 = bank.to_btree_map();
-        assert_eq!(m, m2);
     }
 
     #[test]
@@ -375,6 +315,8 @@ mod tests {
         assert_eq!(PcrAlgorithm::try_from(0x000Bu16), Ok(PcrAlgorithm::Sha256));
         assert_eq!(PcrAlgorithm::try_from(0x000Cu16), Ok(PcrAlgorithm::Sha384));
         assert_eq!(PcrAlgorithm::try_from(0x9999u16), Err(0x9999));
+        assert_eq!(PcrAlgorithm::Sha256.to_string(), "sha256");
+        assert_eq!(PcrAlgorithm::Sha384.to_string(), "sha384");
     }
 
     #[test]

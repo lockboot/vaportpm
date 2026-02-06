@@ -16,8 +16,6 @@ pub mod pcr;
 mod tpm;
 mod x509;
 
-use std::collections::BTreeMap;
-
 use serde::Serialize;
 use x509::parse_cert_chain_pem;
 
@@ -202,19 +200,24 @@ impl DecodedAttestationOutput {
         let quote_attest = hex::decode(&tpm.attest_data)?;
         let quote_signature = hex::decode(&tpm.signature)?;
 
-        let mut pcrs_raw = BTreeMap::new();
+        let mut pcr_entries = Vec::new();
+        let mut algorithm = None;
         for (alg_name, pcr_map) in &output.pcrs {
-            let alg_id = match alg_name.as_str() {
-                "sha256" => PcrAlgorithm::Sha256 as u16,
-                "sha384" => PcrAlgorithm::Sha384 as u16,
+            let alg = match alg_name.as_str() {
+                "sha256" => PcrAlgorithm::Sha256,
+                "sha384" => PcrAlgorithm::Sha384,
                 _ => continue,
             };
+            if algorithm.is_some() && algorithm != Some(alg) {
+                return Err(InvalidAttestReason::PcrBankMixedAlgorithms.into());
+            }
+            algorithm = Some(alg);
             for (idx, hex_value) in pcr_map {
-                let value = hex::decode(hex_value)?;
-                pcrs_raw.insert((alg_id, *idx), value);
+                pcr_entries.push((*idx, hex::decode(hex_value)?));
             }
         }
-        let pcrs = PcrBank::from_btree_map(&pcrs_raw)?;
+        let algorithm = algorithm.ok_or(InvalidAttestReason::PcrBankEmpty)?;
+        let pcrs = PcrBank::from_values(algorithm, pcr_entries)?;
 
         let platform = if let Some(ref gcp) = output.attestation.gcp {
             let certs = parse_cert_chain_pem(&gcp.ak_cert_chain)?;

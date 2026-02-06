@@ -364,20 +364,12 @@ pub fn ephemeral_time() -> UnixTime {
 
 /// Build 24 SHA-384 PCR values (for Nitro).
 pub fn make_nitro_pcrs() -> PcrBank {
-    let mut m = BTreeMap::new();
-    for idx in 0u8..24 {
-        m.insert((PcrAlgorithm::Sha384 as u16, idx), vec![idx; 48]);
-    }
-    PcrBank::from_btree_map(&m).unwrap()
+    PcrBank::from_values(PcrAlgorithm::Sha384, (0u8..24).map(|i| (i, vec![i; 48]))).unwrap()
 }
 
 /// Build 24 SHA-256 PCR values (for GCP).
 pub fn make_gcp_pcrs() -> PcrBank {
-    let mut m = BTreeMap::new();
-    for idx in 0u8..24 {
-        m.insert((PcrAlgorithm::Sha256 as u16, idx), vec![idx; 32]);
-    }
-    PcrBank::from_btree_map(&m).unwrap()
+    PcrBank::from_values(PcrAlgorithm::Sha256, (0u8..24).map(|i| (i, vec![i; 32]))).unwrap()
 }
 
 /// Build a complete, cryptographically valid Nitro attestation.

@@ -287,7 +287,7 @@ fn test_nitro_reject_non_sha384_pcrs() {
     let mut output = load_nitro_fixture();
 
     // Remove the SHA-384 bank entirely, substitute 24 SHA-256 entries
-    // so that PcrBank::from_btree_map succeeds. Nitro then rejects it
+    // so that PcrBank::from_values succeeds. Nitro then rejects it
     // with WrongPcrBankAlgorithm.
     output.pcrs.remove("sha384");
     let mut sha256_pcrs = BTreeMap::new();
@@ -316,13 +316,13 @@ fn test_nitro_reject_non_sha384_pcrs() {
 /// Attestation has SHA-384 PCRs but also includes SHA-256 PCRs.
 /// PcrBank rejects mixed algorithms at decode time.
 ///
-/// Detected at: PcrBank::from_btree_map — PcrBankMixedAlgorithms
+/// Detected at: PcrBank::from_values — PcrBankMixedAlgorithms
 #[test]
 fn test_nitro_reject_extra_sha256_pcrs() {
     let mut output = load_nitro_fixture();
 
     // Add a SHA-256 bank alongside the existing SHA-384 bank.
-    // PcrBank::from_btree_map rejects mixed algorithms.
+    // PcrBank::from_values rejects mixed algorithms.
     let mut sha256_pcrs = BTreeMap::new();
     sha256_pcrs.insert(
         0u8,
@@ -392,4 +392,4 @@ fn test_nitro_decoded_reject_corrupted_cose_document() {
 // - test_nitro_decoded_reject_pcr_index_out_of_range (PcrBank indices are 0-23)
 // - test_nitro_decoded_reject_missing_pcr (PcrBank has all 24)
 //
-// These invariants are now tested in pcr.rs unit tests via PcrBank::from_btree_map.
+// These invariants are now tested in pcr.rs unit tests via PcrBank::from_values.

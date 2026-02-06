@@ -3,13 +3,14 @@
 //! Flat binary format for zkVM input - uses zerocopy for zero-copy parsing
 //!
 //! Use `flat::to_bytes()` on host, `flat::from_bytes()` in guest with `env::read_slice()`.
-
-use std::collections::BTreeMap;
+//!
+//! PCR values are stored as contiguous bytes in index order (0-23),
+//! with the algorithm stored in the header. No per-entry headers.
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::error::InvalidAttestReason;
-use crate::pcr::{P256PublicKey, PcrBank};
+use crate::pcr::{P256PublicKey, PcrAlgorithm, PcrBank, PCR_COUNT};
 use crate::{DecodedAttestationOutput, DecodedPlatformAttestation, VerifyError};
 
 /// Platform type constants
@@ -25,7 +26,8 @@ pub struct FlatHeader {
     pub platform_type: u8,
     pub quote_attest_len: u16,
     pub quote_signature_len: u16,
-    pub pcr_count: u8,
+    /// TPM algorithm ID (0x000B = SHA-256, 0x000C = SHA-384)
+    pub pcr_algorithm: u16,
     pub platform_data_len: u16,
 }
 
@@ -55,8 +57,9 @@ pub fn to_bytes(decoded: &DecodedAttestationOutput) -> Vec<u8> {
         DecodedPlatformAttestation::Nitro { document } => document.clone(),
     };
 
-    let alg_u16 = decoded.pcrs.algorithm() as u16;
-    let digest_len = decoded.pcrs.algorithm().digest_len();
+    let algorithm = decoded.pcrs.algorithm();
+    let digest_len = algorithm.digest_len();
+    let pcr_data_len = PCR_COUNT * digest_len;
 
     let header = FlatHeader {
         nonce: decoded.nonce,
@@ -64,20 +67,17 @@ pub fn to_bytes(decoded: &DecodedAttestationOutput) -> Vec<u8> {
         platform_type,
         quote_attest_len: decoded.quote_attest.len() as u16,
         quote_signature_len: decoded.quote_signature.len() as u16,
-        pcr_count: crate::pcr::PCR_COUNT as u8,
+        pcr_algorithm: algorithm as u16,
         platform_data_len: platform_data.len() as u16,
     };
 
-    let mut buf = Vec::with_capacity(HEADER_SIZE + 2048 + platform_data.len());
+    let mut buf = Vec::with_capacity(HEADER_SIZE + pcr_data_len + 2048 + platform_data.len());
 
     // Write header as bytes (zerocopy ensures correct layout)
     buf.extend_from_slice(header.as_bytes());
 
-    // Write PCRs: [alg_u16(2 bytes LE), pcr_idx, len, value...]
-    for (idx, value) in decoded.pcrs.values().enumerate() {
-        buf.extend_from_slice(&alg_u16.to_le_bytes());
-        buf.push(idx as u8);
-        buf.push(digest_len as u8);
+    // Write PCRs: 24 contiguous values in index order, no per-entry headers
+    for value in decoded.pcrs.values() {
         buf.extend_from_slice(value);
     }
 
@@ -101,40 +101,26 @@ pub fn from_bytes(data: &[u8]) -> Result<DecodedAttestationOutput, VerifyError> 
         .into());
     }
 
-    // Zero-copy header parsing!
+    // Zero-copy header parsing
     let (header, _suffix) =
         FlatHeader::ref_from_prefix(data).map_err(|_| InvalidAttestReason::FlatHeaderInvalid)?;
 
     let quote_attest_len = header.quote_attest_len as usize;
     let quote_signature_len = header.quote_signature_len as usize;
-    let pcr_count = header.pcr_count as usize;
     let platform_data_len = header.platform_data_len as usize;
+
+    let algorithm = PcrAlgorithm::try_from(header.pcr_algorithm)
+        .map_err(|alg_id| InvalidAttestReason::UnknownPcrAlgorithm { alg_id })?;
+    let pcr_data_len = PCR_COUNT * algorithm.digest_len();
 
     let mut offset = HEADER_SIZE;
 
-    // Parse PCRs: [alg_u16(2 bytes LE), pcr_idx, len, value...]
-    let mut pcrs = BTreeMap::new();
-    for _ in 0..pcr_count {
-        if offset + 4 > data.len() {
-            return Err(InvalidAttestReason::FlatTruncated {
-                field: "PCR header",
-            }
-            .into());
-        }
-        let alg_u16 = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
-        let pcr_idx = data[offset + 2];
-        let value_len = data[offset + 3] as usize;
-        offset += 4;
-
-        if offset + value_len > data.len() {
-            return Err(InvalidAttestReason::FlatTruncated { field: "PCR value" }.into());
-        }
-        pcrs.insert(
-            (alg_u16, pcr_idx),
-            data[offset..offset + value_len].to_vec(),
-        );
-        offset += value_len;
+    // Parse PCRs: contiguous block of 24 * digest_len bytes
+    if offset + pcr_data_len > data.len() {
+        return Err(InvalidAttestReason::FlatTruncated { field: "PCR data" }.into());
     }
+    let pcr_bank = PcrBank::from_contiguous(algorithm, &data[offset..offset + pcr_data_len])?;
+    offset += pcr_data_len;
 
     // Parse quote data
     if offset + quote_attest_len > data.len() {
@@ -212,7 +198,6 @@ pub fn from_bytes(data: &[u8]) -> Result<DecodedAttestationOutput, VerifyError> 
         }
     };
 
-    let pcr_bank = PcrBank::from_btree_map(&pcrs)?;
     let ak_pubkey = P256PublicKey::from_sec1_uncompressed(&header.ak_pubkey)?;
 
     Ok(DecodedAttestationOutput {

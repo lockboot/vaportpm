@@ -24,18 +24,13 @@ struct VerificationResultJson {
 
 impl From<VerificationResult> for VerificationResultJson {
     fn from(result: VerificationResult) -> Self {
-        let alg_name = match result.pcrs.algorithm() {
-            vaportpm_verify::PcrAlgorithm::Sha256 => "sha256",
-            vaportpm_verify::PcrAlgorithm::Sha384 => "sha384",
-        };
-
         let mut pcr_map = BTreeMap::new();
         for (idx, value) in result.pcrs.values().enumerate() {
             pcr_map.insert(idx as u8, hex::encode(value));
         }
 
         let mut pcrs = BTreeMap::new();
-        pcrs.insert(alg_name.to_string(), pcr_map);
+        pcrs.insert(result.pcrs.algorithm().to_string(), pcr_map);
 
         VerificationResultJson {
             nonce: hex::encode(result.nonce),

@@ -249,7 +249,7 @@ fn test_gcp_reject_non_sha256_pcrs() {
     let mut output = load_gcp_amd_fixture();
 
     // Remove the SHA-256 bank entirely, substitute 24 SHA-384 entries
-    // so that PcrBank::from_btree_map succeeds. GCP then rejects it
+    // so that PcrBank::from_values succeeds. GCP then rejects it
     // with WrongPcrBankAlgorithm.
     output.pcrs.remove("sha256");
     let mut sha384_pcrs = BTreeMap::new();
@@ -281,13 +281,12 @@ fn test_gcp_reject_non_sha256_pcrs() {
 
 /// Removing a PCR from the attestation when all 24 are required.
 ///
-/// Detected at: PcrBank::from_btree_map — rejects incomplete PCR sets
+/// Detected at: PcrBank::from_values — rejects incomplete PCR sets
 #[test]
 fn test_gcp_reject_missing_pcr() {
     let mut output = load_gcp_amd_fixture();
 
-    // Remove PCR 0 — hits PcrBankWrongCount at decode time
-    // (23 entries instead of 24)
+    // Remove PCR 0 — hits MissingPcr at decode time
     if let Some(sha256_pcrs) = output.pcrs.get_mut("sha256") {
         sha256_pcrs.remove(&0u8);
     }
@@ -297,10 +296,7 @@ fn test_gcp_reject_missing_pcr() {
         matches!(
             result,
             Err(VerifyError::InvalidAttest(
-                InvalidAttestReason::PcrBankWrongCount {
-                    expected: 24,
-                    got: 23
-                }
+                InvalidAttestReason::MissingPcr { index: 0 }
             ))
         ),
         "Should reject when a PCR is missing, got: {:?}",
