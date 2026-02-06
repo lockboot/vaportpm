@@ -17,11 +17,11 @@ Physical TPM trust is vapor. It evaporates under scrutiny - supply chain attacks
 
 The verifier handles **cryptographic verification**:
 - Validates signatures and certificate chains
-- Returns the SHA-256 hash of the trust anchor's public key
+- Identifies the cloud provider via embedded root CA hashes
 
 You handle **policy decisions**:
-- Is this trust root acceptable?
 - Do the PCR values match known-good measurements?
+- Is the nonce fresh (replay protection)?
 
 ## Supported Platforms
 

@@ -1,4 +1,4 @@
-/target
+target
 Cargo.lock
 .ssh
 .rustup
@@ -13,3 +13,8 @@ Cargo.lock
 .config
 .gitconfig
 .cargo
+.bash_history
+.risc0
+.bashrc
+/go
+old

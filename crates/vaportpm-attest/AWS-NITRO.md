@@ -159,7 +159,7 @@ COSE_Sign1 = [
       ...
     }
   },
-  "signing_key_public_keys": {
+  "ak_pubkeys": {
     "ecc_p256": {
       "x": "3678325466f129d8279056737fe48378...",
       "y": "9384bc5fafdc7938f9a51e09490a5555..."

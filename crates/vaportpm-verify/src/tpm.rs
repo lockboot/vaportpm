@@ -6,28 +6,31 @@ use ecdsa::signature::hazmat::PrehashVerifier;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use sha2::{Digest, Sha256};
 
-use crate::error::VerifyError;
+use crate::error::{InvalidAttestReason, SignatureInvalidReason, VerifyError};
+use crate::pcr::PcrBank;
 
 /// Verify ECDSA-SHA256 signature over a message
-pub fn verify_ecdsa_p256(
+pub(crate) fn verify_ecdsa_p256(
     message: &[u8],
     signature_der: &[u8],
     public_key: &[u8],
 ) -> Result<(), VerifyError> {
     // Parse the public key (SEC1/SECG format: 0x04 || X || Y for uncompressed)
     let verifying_key = P256VerifyingKey::from_sec1_bytes(public_key)
-        .map_err(|e| VerifyError::SignatureInvalid(format!("Invalid public key: {}", e)))?;
+        .map_err(|e| SignatureInvalidReason::InvalidPublicKey(e.to_string()))?;
 
     // Parse the DER-encoded signature
     let signature = P256Signature::from_der(signature_der)
-        .map_err(|e| VerifyError::SignatureInvalid(format!("Invalid signature DER: {}", e)))?;
+        .map_err(|e| SignatureInvalidReason::InvalidSignatureEncoding(e.to_string()))?;
 
     // TPM signs the SHA-256 hash of the message
     let digest = Sha256::digest(message);
 
     verifying_key
         .verify_prehash(&digest, &signature)
-        .map_err(|e| VerifyError::SignatureInvalid(format!("Signature verification failed: {}", e)))
+        .map_err(|e| SignatureInvalidReason::EcdsaVerificationFailed(e.to_string()))?;
+
+    Ok(())
 }
 
 // =============================================================================
@@ -45,10 +48,11 @@ const TPMS_CLOCK_INFO_SIZE: usize = 17;
 
 /// Parsed TPMS_ATTEST structure (from TPM2_Quote)
 #[derive(Debug)]
-pub struct TpmQuoteInfo {
+pub(crate) struct TpmQuoteInfo {
     /// Nonce/qualifying data from extraData field (raw bytes)
     pub nonce: Vec<u8>,
-    /// Name of the signing key
+    /// Name of the signing key (parsed to advance cursor; not used for verification)
+    #[allow(dead_code)]
     pub signer_name: Vec<u8>,
     /// PCR selection (algorithm, PCR indices as bitmap)
     pub pcr_select: Vec<(u16, Vec<u8>)>,
@@ -67,47 +71,49 @@ pub struct TpmQuoteInfo {
 /// - firmwareVersion: u64
 /// - attested.quote.pcrSelect: TPML_PCR_SELECTION (PCRs that were quoted)
 /// - attested.quote.pcrDigest: TPM2B_DIGEST (hash of PCR values)
-pub fn parse_quote_attest(data: &[u8]) -> Result<TpmQuoteInfo, VerifyError> {
+pub(crate) fn parse_quote_attest(data: &[u8]) -> Result<TpmQuoteInfo, VerifyError> {
     let mut cursor = SafeCursor::new(data);
 
     // magic (4 bytes)
-    let magic_bytes = cursor.read_bytes(4, "magic")?;
+    let magic_bytes = cursor.read_bytes(4)?;
     let magic = u32::from_be_bytes(magic_bytes.try_into().unwrap());
     if magic != TPM_GENERATED_VALUE {
-        return Err(VerifyError::InvalidAttest(format!(
-            "Invalid TPM magic: expected 0x{:08x}, got 0x{:08x}",
-            TPM_GENERATED_VALUE, magic
-        )));
+        return Err(InvalidAttestReason::TpmMagicInvalid {
+            expected: TPM_GENERATED_VALUE,
+            got: magic,
+        }
+        .into());
     }
 
     // type (2 bytes)
-    let type_bytes = cursor.read_bytes(2, "type")?;
+    let type_bytes = cursor.read_bytes(2)?;
     let attest_type = u16::from_be_bytes(type_bytes.try_into().unwrap());
     if attest_type != TPM_ST_ATTEST_QUOTE {
-        return Err(VerifyError::InvalidAttest(format!(
-            "Invalid attest type: expected 0x{:04x} (QUOTE), got 0x{:04x}",
-            TPM_ST_ATTEST_QUOTE, attest_type
-        )));
+        return Err(InvalidAttestReason::TpmTypeInvalid {
+            expected: TPM_ST_ATTEST_QUOTE,
+            got: attest_type,
+        }
+        .into());
     }
 
     // qualifiedSigner (TPM2B_NAME)
-    let signer_name = cursor.read_tpm2b("qualifiedSigner")?;
+    let signer_name = cursor.read_tpm2b()?;
 
     // extraData (TPM2B_DATA) - this is our nonce
-    let nonce = cursor.read_tpm2b("extraData")?;
+    let nonce = cursor.read_tpm2b()?;
 
     // clockInfo (TPMS_CLOCK_INFO) - skip it
-    cursor.skip(TPMS_CLOCK_INFO_SIZE, "clockInfo")?;
+    cursor.skip(TPMS_CLOCK_INFO_SIZE)?;
 
     // firmwareVersion (8 bytes) - skip it
-    cursor.skip(8, "firmwareVersion")?;
+    cursor.skip(8)?;
 
     // attested (TPMS_QUOTE_INFO)
     // - pcrSelect (TPML_PCR_SELECTION)
-    let pcr_select = cursor.read_pcr_selection("pcrSelect")?;
+    let pcr_select = cursor.read_pcr_selection()?;
 
     // - pcrDigest (TPM2B_DIGEST)
-    let pcr_digest = cursor.read_tpm2b("pcrDigest")?;
+    let pcr_digest = cursor.read_tpm2b()?;
 
     Ok(TpmQuoteInfo {
         nonce,
@@ -129,12 +135,20 @@ impl<'a> SafeCursor<'a> {
     }
 
     /// Read exactly `len` bytes, returning error on overflow or truncation
-    fn read_bytes(&mut self, len: usize, field: &str) -> Result<&'a [u8], VerifyError> {
-        let end = self.offset.checked_add(len).ok_or_else(|| {
-            VerifyError::InvalidAttest(format!("Integer overflow reading {}", field))
-        })?;
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], VerifyError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(VerifyError::InvalidAttest(
+                InvalidAttestReason::TpmOverflow {
+                    offset: self.offset,
+                },
+            ))?;
         if end > self.data.len() {
-            return Err(VerifyError::InvalidAttest(format!("Truncated {}", field)));
+            return Err(InvalidAttestReason::TpmTruncated {
+                offset: self.offset,
+            }
+            .into());
         }
         let bytes = &self.data[self.offset..end];
         self.offset = end;
@@ -142,85 +156,168 @@ impl<'a> SafeCursor<'a> {
     }
 
     /// Skip exactly `len` bytes
-    fn skip(&mut self, len: usize, field: &str) -> Result<(), VerifyError> {
-        let end = self.offset.checked_add(len).ok_or_else(|| {
-            VerifyError::InvalidAttest(format!("Integer overflow skipping {}", field))
-        })?;
+    fn skip(&mut self, len: usize) -> Result<(), VerifyError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(VerifyError::InvalidAttest(
+                InvalidAttestReason::TpmOverflow {
+                    offset: self.offset,
+                },
+            ))?;
         if end > self.data.len() {
-            return Err(VerifyError::InvalidAttest(format!("Truncated {}", field)));
+            return Err(InvalidAttestReason::TpmTruncated {
+                offset: self.offset,
+            }
+            .into());
         }
         self.offset = end;
         Ok(())
     }
 
     /// Read a TPM2B structure (2-byte size prefix + data)
-    fn read_tpm2b(&mut self, field: &str) -> Result<Vec<u8>, VerifyError> {
-        let size_bytes = self.read_bytes(2, field)?;
+    fn read_tpm2b(&mut self) -> Result<Vec<u8>, VerifyError> {
+        let size_bytes = self.read_bytes(2)?;
         let size = u16::from_be_bytes(size_bytes.try_into().unwrap()) as usize;
-        let data = self.read_bytes(size, field)?;
+        let data = self.read_bytes(size)?;
         Ok(data.to_vec())
     }
 
     /// Read a u16 value (big-endian)
-    fn read_u16(&mut self, field: &str) -> Result<u16, VerifyError> {
-        let bytes = self.read_bytes(2, field)?;
+    fn read_u16(&mut self) -> Result<u16, VerifyError> {
+        let bytes = self.read_bytes(2)?;
         Ok(u16::from_be_bytes(bytes.try_into().unwrap()))
     }
 
     /// Read a u32 value (big-endian)
-    fn read_u32(&mut self, field: &str) -> Result<u32, VerifyError> {
-        let bytes = self.read_bytes(4, field)?;
+    fn read_u32(&mut self) -> Result<u32, VerifyError> {
+        let bytes = self.read_bytes(4)?;
         Ok(u32::from_be_bytes(bytes.try_into().unwrap()))
     }
 
     /// Read a u8 value
-    fn read_u8(&mut self, field: &str) -> Result<u8, VerifyError> {
-        let bytes = self.read_bytes(1, field)?;
+    fn read_u8(&mut self) -> Result<u8, VerifyError> {
+        let bytes = self.read_bytes(1)?;
         Ok(bytes[0])
     }
 
     /// Read TPML_PCR_SELECTION structure
     ///
     /// Returns a list of (algorithm, PCR bitmap) pairs
-    fn read_pcr_selection(&mut self, field: &str) -> Result<Vec<(u16, Vec<u8>)>, VerifyError> {
-        let count = self.read_u32(&format!("{}.count", field))?;
+    fn read_pcr_selection(&mut self) -> Result<Vec<(u16, Vec<u8>)>, VerifyError> {
+        let count = self.read_u32()?;
 
         // Sanity check: count should be reasonable (max ~16 different algorithms)
         if count > 16 {
-            return Err(VerifyError::InvalidAttest(format!(
-                "{}: count {} exceeds reasonable maximum",
-                field, count
-            )));
+            return Err(InvalidAttestReason::PcrSelectionCountExceeded { count }.into());
         }
 
         let mut selections = Vec::with_capacity(count as usize);
-        for i in 0..count {
+        for _ in 0..count {
             // TPMS_PCR_SELECTION:
             // - hash (2 bytes) - algorithm
-            let hash_alg = self.read_u16(&format!("{}.selection[{}].hash", field, i))?;
+            let hash_alg = self.read_u16()?;
 
             // - sizeofSelect (1 byte) - bitmap size (typically 3 for 24 PCRs)
-            let bitmap_size = self.read_u8(&format!("{}.selection[{}].sizeofSelect", field, i))?;
+            let bitmap_size = self.read_u8()?;
 
             // Sanity check: bitmap size should be reasonable (max 32 for 256 PCRs)
             if bitmap_size > 32 {
-                return Err(VerifyError::InvalidAttest(format!(
-                    "{}.selection[{}].sizeofSelect {} exceeds maximum",
-                    field, i, bitmap_size
-                )));
+                return Err(
+                    InvalidAttestReason::PcrBitmapSizeExceeded { size: bitmap_size }.into(),
+                );
             }
 
             // - pcrSelect (variable) - bitmap
-            let bitmap = self.read_bytes(
-                bitmap_size as usize,
-                &format!("{}.selection[{}].pcrSelect", field, i),
-            )?;
+            let bitmap = self.read_bytes(bitmap_size as usize)?;
 
             selections.push((hash_alg, bitmap.to_vec()));
         }
 
         Ok(selections)
     }
+}
+
+/// Verify that the PCR digest in a Quote matches the claimed PCR values
+///
+/// The TPM Quote contains a PCR digest (SHA-256 of concatenated PCR values).
+/// PcrBank guarantees all 24 values in order, so we just hash them sequentially.
+pub(crate) fn verify_pcr_digest_matches(
+    quote_info: &TpmQuoteInfo,
+    pcrs: &PcrBank,
+) -> Result<(), VerifyError> {
+    let mut hasher = Sha256::new();
+    for value in pcrs.values() {
+        hasher.update(value);
+    }
+
+    let computed_digest = hasher.finalize();
+    if computed_digest.as_ref() != quote_info.pcr_digest {
+        return Err(InvalidAttestReason::PcrDigestMismatch.into());
+    }
+
+    Ok(())
+}
+
+/// Verify a TPM2_Quote: signature, PCR bank selection, nonce, and PCR digest.
+///
+/// This is the shared core of both GCP and Nitro verification. The only
+/// platform-specific input is `expected_alg` (Sha256 for GCP, Sha384 for Nitro).
+///
+/// After this returns successfully, the quote is fully authenticated and the
+/// PCR values in `decoded.pcrs` are proven to match the signed digest.
+pub(crate) fn verify_quote(
+    decoded: &crate::DecodedAttestationOutput,
+    expected_alg: crate::pcr::PcrAlgorithm,
+) -> Result<TpmQuoteInfo, VerifyError> {
+    let quote_info = parse_quote_attest(&decoded.quote_attest)?;
+
+    let ak_sec1 = decoded.ak_pubkey.to_sec1_uncompressed();
+    verify_ecdsa_p256(&decoded.quote_attest, &decoded.quote_signature, &ak_sec1)?;
+
+    // --- Quote is now authenticated; safe to trust its contents ---
+
+    // Enforce exactly one PCR bank with the expected algorithm, all 24 PCRs selected.
+    if quote_info.pcr_select.len() != 1 {
+        return Err(InvalidAttestReason::MultiplePcrBanks {
+            count: quote_info.pcr_select.len(),
+        }
+        .into());
+    }
+    let (quote_alg, quote_bitmap) = &quote_info.pcr_select[0];
+    if *quote_alg != expected_alg as u16 {
+        return Err(InvalidAttestReason::WrongPcrAlgorithm {
+            expected: expected_alg,
+            got: *quote_alg,
+        }
+        .into());
+    }
+    if quote_bitmap.len() < 3
+        || quote_bitmap[0] != 0xFF
+        || quote_bitmap[1] != 0xFF
+        || quote_bitmap[2] != 0xFF
+    {
+        return Err(InvalidAttestReason::PartialPcrBitmap.into());
+    }
+
+    // Verify PcrBank algorithm matches expected
+    if decoded.pcrs.algorithm() != expected_alg {
+        return Err(InvalidAttestReason::WrongPcrBankAlgorithm {
+            expected: expected_alg,
+            got: decoded.pcrs.algorithm(),
+        }
+        .into());
+    }
+
+    // Verify nonce matches Quote
+    if decoded.nonce != quote_info.nonce.as_slice() {
+        return Err(InvalidAttestReason::NonceMismatch.into());
+    }
+
+    // Verify PCR digest matches claimed PCR values
+    verify_pcr_digest_matches(&quote_info, &decoded.pcrs)?;
+
+    Ok(quote_info)
 }
 
 #[cfg(test)]

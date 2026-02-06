@@ -14,7 +14,7 @@ use rsa::RsaPublicKey;
 use sha2::{Digest, Sha256};
 use x509_cert::Certificate;
 
-use crate::error::VerifyError;
+use crate::error::{CertificateParseReason, ChainValidationReason, VerifyError};
 
 // X.509 extension OIDs
 const OID_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15");
@@ -23,7 +23,7 @@ const OID_BASIC_CONSTRAINTS: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.
 /// Key Usage extension flags (OID 2.5.29.15)
 /// Only includes bits used for TPM certificate chain validation.
 #[derive(Debug, Clone, Default)]
-pub struct KeyUsageFlags {
+pub(crate) struct KeyUsageFlags {
     /// digitalSignature (bit 0) - key can be used to verify digital signatures
     pub digital_signature: bool,
     /// keyCertSign (bit 5) - key can be used to verify certificate signatures
@@ -32,7 +32,7 @@ pub struct KeyUsageFlags {
 
 /// Basic Constraints extension (OID 2.5.29.19)
 #[derive(Debug, Clone, Default)]
-pub struct BasicConstraints {
+pub(crate) struct BasicConstraints {
     /// Whether this certificate is a CA
     pub ca: bool,
     /// Maximum number of intermediate certificates allowed below this CA
@@ -42,7 +42,7 @@ pub struct BasicConstraints {
 /// Extract Key Usage extension from a certificate (OID 2.5.29.15)
 ///
 /// Returns None if the extension is not present.
-pub fn extract_key_usage(cert: &Certificate) -> Option<KeyUsageFlags> {
+pub(crate) fn extract_key_usage(cert: &Certificate) -> Option<KeyUsageFlags> {
     let extensions = cert.tbs_certificate.extensions.as_ref()?;
 
     for ext in extensions.iter() {
@@ -74,7 +74,7 @@ pub fn extract_key_usage(cert: &Certificate) -> Option<KeyUsageFlags> {
 /// Extract Basic Constraints extension from a certificate (OID 2.5.29.19)
 ///
 /// Returns None if the extension is not present.
-pub fn extract_basic_constraints(cert: &Certificate) -> Option<BasicConstraints> {
+pub(crate) fn extract_basic_constraints(cert: &Certificate) -> Option<BasicConstraints> {
     let extensions = cert.tbs_certificate.extensions.as_ref()?;
 
     for ext in extensions.iter() {
@@ -135,7 +135,7 @@ pub fn extract_basic_constraints(cert: &Certificate) -> Option<BasicConstraints>
 }
 
 /// Maximum allowed certificate chain depth (to prevent DoS)
-pub const MAX_CHAIN_DEPTH: usize = 10;
+pub(crate) const MAX_CHAIN_DEPTH: usize = 10;
 
 /// PEM certificate begin marker
 const PEM_CERT_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
@@ -150,23 +150,18 @@ const PEM_CERT_END: &str = "-----END CERTIFICATE-----";
 /// - Exact BEGIN/END markers (not just "contains")
 /// - No non-whitespace data between certificates
 /// - Valid base64 content within certificate blocks
-pub fn parse_cert_chain_pem(pem: &str) -> Result<Vec<Certificate>, VerifyError> {
+pub(crate) fn parse_cert_chain_pem(pem: &str) -> Result<Vec<Certificate>, VerifyError> {
     let mut certs = Vec::new();
     let mut current_cert = String::new();
     let mut in_cert = false;
-    let mut line_number = 0;
-
-    for line in pem.lines() {
-        line_number += 1;
+    for (idx, line) in pem.lines().enumerate() {
+        let line_number = idx + 1;
         let trimmed = line.trim();
 
         // Check for BEGIN marker
         if trimmed == PEM_CERT_BEGIN {
             if in_cert {
-                return Err(VerifyError::CertificateParse(format!(
-                    "Line {}: Unexpected BEGIN marker inside certificate block",
-                    line_number
-                )));
+                return Err(CertificateParseReason::NestedBeginMarker { line: line_number }.into());
             }
             in_cert = true;
             current_cert.clear();
@@ -176,25 +171,18 @@ pub fn parse_cert_chain_pem(pem: &str) -> Result<Vec<Certificate>, VerifyError> 
         // Check for END marker
         if trimmed == PEM_CERT_END {
             if !in_cert {
-                return Err(VerifyError::CertificateParse(format!(
-                    "Line {}: END marker without matching BEGIN",
-                    line_number
-                )));
+                return Err(CertificateParseReason::EndWithoutBegin { line: line_number }.into());
             }
             in_cert = false;
 
             // Decode the certificate
             if current_cert.is_empty() {
-                return Err(VerifyError::CertificateParse(format!(
-                    "Line {}: Empty certificate content",
-                    line_number
-                )));
+                return Err(CertificateParseReason::EmptyCertContent { line: line_number }.into());
             }
 
             let der_bytes = base64_decode(&current_cert)?;
-            let cert = Certificate::from_der(&der_bytes).map_err(|e| {
-                VerifyError::CertificateParse(format!("Line {}: Invalid DER: {}", line_number, e))
-            })?;
+            let cert = Certificate::from_der(&der_bytes)
+                .map_err(|e| CertificateParseReason::InvalidDer(e.to_string()))?;
             certs.push(cert);
             continue;
         }
@@ -203,10 +191,7 @@ pub fn parse_cert_chain_pem(pem: &str) -> Result<Vec<Certificate>, VerifyError> 
         if in_cert {
             // Validate that line contains only base64 characters
             if !trimmed.is_empty() && !is_valid_base64_line(trimmed) {
-                return Err(VerifyError::CertificateParse(format!(
-                    "Line {}: Invalid base64 character in certificate",
-                    line_number
-                )));
+                return Err(CertificateParseReason::InvalidBase64 { line: line_number }.into());
             }
             current_cert.push_str(trimmed);
             continue;
@@ -214,29 +199,17 @@ pub fn parse_cert_chain_pem(pem: &str) -> Result<Vec<Certificate>, VerifyError> 
 
         // Outside certificate blocks: only whitespace is allowed
         if !trimmed.is_empty() {
-            return Err(VerifyError::CertificateParse(format!(
-                "Line {}: Unexpected content outside certificate block: '{}'",
-                line_number,
-                if trimmed.len() > 20 {
-                    &trimmed[..20]
-                } else {
-                    trimmed
-                }
-            )));
+            return Err(CertificateParseReason::UnexpectedContent { line: line_number }.into());
         }
     }
 
     // Check for unclosed certificate block
     if in_cert {
-        return Err(VerifyError::CertificateParse(
-            "Unclosed certificate block (missing END marker)".into(),
-        ));
+        return Err(CertificateParseReason::UnclosedBlock.into());
     }
 
     if certs.is_empty() {
-        return Err(VerifyError::CertificateParse(
-            "No certificates found in PEM".into(),
-        ));
+        return Err(CertificateParseReason::NoCertificates.into());
     }
 
     Ok(certs)
@@ -250,34 +223,33 @@ fn is_valid_base64_line(s: &str) -> bool {
 
 /// Decode base64 string
 fn base64_decode(input: &str) -> Result<Vec<u8>, VerifyError> {
-    STANDARD
-        .decode(input)
-        .map_err(|e| VerifyError::CertificateParse(format!("Invalid base64: {}", e)))
+    STANDARD.decode(input).map_err(|e| {
+        VerifyError::CertificateParse(CertificateParseReason::InvalidDer(e.to_string()))
+    })
 }
 
 /// Extract raw public key bytes from an X.509 certificate
 ///
 /// Returns the SubjectPublicKeyInfo's bit string contents
-pub fn extract_public_key(cert: &Certificate) -> Result<Vec<u8>, VerifyError> {
+pub(crate) fn extract_public_key(cert: &Certificate) -> Result<Vec<u8>, VerifyError> {
     let spki = &cert.tbs_certificate.subject_public_key_info;
     let pubkey_bits = spki
         .subject_public_key
         .as_bytes()
-        .ok_or_else(|| VerifyError::CertificateParse("Public key has unused bits".into()))?;
+        .ok_or(CertificateParseReason::PublicKeyUnusedBits)?;
     Ok(pubkey_bits.to_vec())
 }
 
-/// Compute SHA-256 hash of public key and return as hex string
-pub fn hash_public_key(pubkey_bytes: &[u8]) -> String {
-    let digest = Sha256::digest(pubkey_bytes);
-    hex::encode(digest)
+/// Compute SHA-256 hash of public key
+pub(crate) fn hash_public_key(pubkey_bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(pubkey_bytes).into()
 }
 
 /// Result of certificate chain validation
 #[derive(Debug)]
-pub struct ChainValidationResult {
-    /// SHA-256 hash of the root CA's public key (hex string)
-    pub root_pubkey_hash: String,
+pub(crate) struct ChainValidationResult {
+    /// SHA-256 hash of the root CA's public key
+    pub root_pubkey_hash: [u8; 32],
 }
 
 /// Validate certificate chain with rigid X.509 validation
@@ -309,21 +281,19 @@ pub struct ChainValidationResult {
 /// - Each certificate's Issuer must match its parent's Subject
 ///
 /// Chain should be leaf-first, root-last.
-pub fn validate_tpm_cert_chain(
+pub(crate) fn validate_tpm_cert_chain(
     chain: &[Certificate],
     time: UnixTime,
 ) -> Result<ChainValidationResult, VerifyError> {
     if chain.is_empty() {
-        return Err(VerifyError::ChainValidation(
-            "Empty certificate chain".into(),
-        ));
+        return Err(ChainValidationReason::EmptyChain.into());
     }
     if chain.len() > MAX_CHAIN_DEPTH {
-        return Err(VerifyError::ChainValidation(format!(
-            "Certificate chain too deep: {} certificates (max {})",
-            chain.len(),
-            MAX_CHAIN_DEPTH
-        )));
+        return Err(ChainValidationReason::ChainTooDeep {
+            depth: chain.len(),
+            max: MAX_CHAIN_DEPTH,
+        }
+        .into());
     }
 
     // === X.509 Extension Validation ===
@@ -336,15 +306,10 @@ pub fn validate_tpm_cert_chain(
         // 1. Basic Constraints validation
         if let Some(bc) = extract_basic_constraints(cert) {
             if is_leaf && bc.ca {
-                return Err(VerifyError::ChainValidation(
-                    "Leaf certificate has CA:TRUE - must be CA:FALSE".into(),
-                ));
+                return Err(ChainValidationReason::LeafIsCa.into());
             }
             if !is_leaf && !bc.ca {
-                return Err(VerifyError::ChainValidation(format!(
-                    "Certificate {} (intermediate/root) must have CA:TRUE",
-                    i
-                )));
+                return Err(ChainValidationReason::CaMissingCaFlag { index: i }.into());
             }
 
             // Check pathLenConstraint for CA certificates
@@ -358,50 +323,39 @@ pub fn validate_tpm_cert_chain(
                     // (position 0 is leaf, positions 1..i-1 are intermediates below)
                     let cas_below = if i > 0 { i - 1 } else { 0 };
                     if cas_below > path_len as usize {
-                        return Err(VerifyError::ChainValidation(format!(
-                            "Certificate {} pathLenConstraint violated: allows {} CAs below, but {} exist",
-                            i, path_len, cas_below
-                        )));
+                        return Err(ChainValidationReason::PathLenViolated {
+                            index: i,
+                            allowed: path_len,
+                            actual: cas_below,
+                        }
+                        .into());
                     }
                 }
             }
         } else if !is_leaf {
             // CA certificates SHOULD have Basic Constraints
             // This is a SHOULD per RFC 5280, but we enforce it for security
-            return Err(VerifyError::ChainValidation(format!(
-                "Certificate {} (intermediate/root) missing Basic Constraints extension",
-                i
-            )));
+            return Err(ChainValidationReason::MissingBasicConstraints { index: i }.into());
         }
 
         // 2. Key Usage validation
         if let Some(ku) = extract_key_usage(cert) {
             if is_leaf && !ku.digital_signature {
-                return Err(VerifyError::ChainValidation(
-                    "Leaf certificate missing digitalSignature key usage".into(),
-                ));
+                return Err(ChainValidationReason::LeafMissingDigitalSignature.into());
             }
             if !is_leaf && !ku.key_cert_sign {
-                return Err(VerifyError::ChainValidation(format!(
-                    "Certificate {} (CA) missing keyCertSign key usage",
-                    i
-                )));
+                return Err(ChainValidationReason::CaMissingKeyCertSign { index: i }.into());
             }
         } else if is_leaf {
             // Leaf certificate MUST have Key Usage for signing
-            return Err(VerifyError::ChainValidation(
-                "Leaf certificate missing Key Usage extension".into(),
-            ));
+            return Err(ChainValidationReason::LeafMissingKeyUsage.into());
         }
 
         // 3. Subject/Issuer name chaining
         if !is_root {
             let parent = &chain[i + 1];
             if cert.tbs_certificate.issuer != parent.tbs_certificate.subject {
-                return Err(VerifyError::ChainValidation(format!(
-                    "Certificate {} issuer does not match parent subject",
-                    i
-                )));
+                return Err(ChainValidationReason::IssuerMismatch { index: i }.into());
             }
         }
     }
@@ -420,7 +374,7 @@ pub fn validate_tpm_cert_chain(
         let tbs_der = cert
             .tbs_certificate
             .to_der()
-            .map_err(|e| VerifyError::ChainValidation(format!("Failed to encode TBS: {}", e)))?;
+            .map_err(|e| ChainValidationReason::CryptoError(e.to_string()))?;
 
         // Get the signature
         let sig_bytes = cert.signature.raw_bytes();
@@ -440,81 +394,63 @@ pub fn validate_tpm_cert_chain(
                 // RSA PKCS#1 v1.5 with SHA-256 verification
                 // For RSA, we need the full SPKI structure, not just raw key bytes
                 let issuer_spki = &issuer.tbs_certificate.subject_public_key_info;
-                let issuer_spki_der = issuer_spki.to_der().map_err(|e| {
-                    VerifyError::ChainValidation(format!("Failed to encode issuer SPKI: {}", e))
-                })?;
+                let issuer_spki_der = issuer_spki
+                    .to_der()
+                    .map_err(|e| ChainValidationReason::CryptoError(e.to_string()))?;
 
                 let rsa_pubkey = RsaPublicKey::try_from(
-                    spki::SubjectPublicKeyInfoRef::try_from(issuer_spki_der.as_slice()).map_err(
-                        |e| VerifyError::ChainValidation(format!("Invalid RSA SPKI: {}", e)),
-                    )?,
+                    spki::SubjectPublicKeyInfoRef::try_from(issuer_spki_der.as_slice())
+                        .map_err(|e| ChainValidationReason::CryptoError(e.to_string()))?,
                 )
-                .map_err(|e| VerifyError::ChainValidation(format!("Invalid RSA key: {}", e)))?;
+                .map_err(|e| ChainValidationReason::CryptoError(e.to_string()))?;
 
                 let verifying_key = RsaVerifyingKey::<Sha256>::new(rsa_pubkey);
 
-                let signature = RsaSignature::try_from(sig_bytes).map_err(|e| {
-                    VerifyError::ChainValidation(format!("Invalid RSA signature: {}", e))
-                })?;
+                let signature = RsaSignature::try_from(sig_bytes)
+                    .map_err(|e| ChainValidationReason::CryptoError(e.to_string()))?;
 
-                verifying_key.verify(&tbs_der, &signature).map_err(|_| {
-                    VerifyError::ChainValidation(format!(
-                        "Certificate {} RSA signature verification failed",
-                        i
-                    ))
-                })?;
+                verifying_key
+                    .verify(&tbs_der, &signature)
+                    .map_err(|_| ChainValidationReason::SignatureVerificationFailed { index: i })?;
             }
             ECDSA_SHA256_OID => {
                 // P-256 verification
                 if issuer_pubkey.len() != 65 || issuer_pubkey[0] != 0x04 {
-                    return Err(VerifyError::ChainValidation(
+                    return Err(ChainValidationReason::CryptoError(
                         "Invalid issuer public key format for P-256".into(),
-                    ));
+                    )
+                    .into());
                 }
-                let verifying_key =
-                    P256VerifyingKey::from_sec1_bytes(&issuer_pubkey).map_err(|e| {
-                        VerifyError::ChainValidation(format!("Invalid P-256 key: {}", e))
-                    })?;
+                let verifying_key = P256VerifyingKey::from_sec1_bytes(&issuer_pubkey)
+                    .map_err(|e| ChainValidationReason::CryptoError(e.to_string()))?;
 
-                let signature = P256Signature::from_der(sig_bytes).map_err(|e| {
-                    VerifyError::ChainValidation(format!("Invalid P-256 signature: {}", e))
-                })?;
+                let signature = P256Signature::from_der(sig_bytes)
+                    .map_err(|e| ChainValidationReason::CryptoError(e.to_string()))?;
 
-                verifying_key.verify(&tbs_der, &signature).map_err(|_| {
-                    VerifyError::ChainValidation(format!(
-                        "Certificate {} signature verification failed",
-                        i
-                    ))
-                })?;
+                verifying_key
+                    .verify(&tbs_der, &signature)
+                    .map_err(|_| ChainValidationReason::SignatureVerificationFailed { index: i })?;
             }
             ECDSA_SHA384_OID => {
                 // P-384 verification
                 if issuer_pubkey.len() != 97 || issuer_pubkey[0] != 0x04 {
-                    return Err(VerifyError::ChainValidation(
+                    return Err(ChainValidationReason::CryptoError(
                         "Invalid issuer public key format for P-384".into(),
-                    ));
+                    )
+                    .into());
                 }
-                let verifying_key =
-                    P384VerifyingKey::from_sec1_bytes(&issuer_pubkey).map_err(|e| {
-                        VerifyError::ChainValidation(format!("Invalid P-384 key: {}", e))
-                    })?;
+                let verifying_key = P384VerifyingKey::from_sec1_bytes(&issuer_pubkey)
+                    .map_err(|e| ChainValidationReason::CryptoError(e.to_string()))?;
 
-                let signature = P384Signature::from_der(sig_bytes).map_err(|e| {
-                    VerifyError::ChainValidation(format!("Invalid P-384 signature: {}", e))
-                })?;
+                let signature = P384Signature::from_der(sig_bytes)
+                    .map_err(|e| ChainValidationReason::CryptoError(e.to_string()))?;
 
-                verifying_key.verify(&tbs_der, &signature).map_err(|_| {
-                    VerifyError::ChainValidation(format!(
-                        "Certificate {} signature verification failed",
-                        i
-                    ))
-                })?;
+                verifying_key
+                    .verify(&tbs_der, &signature)
+                    .map_err(|_| ChainValidationReason::SignatureVerificationFailed { index: i })?;
             }
             _ => {
-                return Err(VerifyError::ChainValidation(format!(
-                    "Unsupported signature algorithm: {}",
-                    alg_str
-                )));
+                return Err(ChainValidationReason::UnsupportedAlgorithm { oid: alg_str }.into());
             }
         }
     }
@@ -532,16 +468,10 @@ pub fn validate_tpm_cert_chain(
         let not_after = validity.not_after.to_unix_duration().as_secs();
 
         if unix_secs < not_before {
-            return Err(VerifyError::ChainValidation(format!(
-                "Certificate {} is not yet valid",
-                i
-            )));
+            return Err(ChainValidationReason::CertNotYetValid { index: i }.into());
         }
         if unix_secs > not_after {
-            return Err(VerifyError::ChainValidation(format!(
-                "Certificate {} has expired",
-                i
-            )));
+            return Err(ChainValidationReason::CertExpired { index: i }.into());
         }
     }
 
@@ -554,18 +484,6 @@ pub fn validate_tpm_cert_chain(
     })
 }
 
-/// Parse PEM and validate TPM certificate chain
-///
-/// Convenience wrapper that parses PEM then validates without EKU checking.
-/// Chain should be leaf-first, root-last in the PEM.
-pub fn parse_and_validate_tpm_cert_chain(
-    chain_pem: &str,
-    time: UnixTime,
-) -> Result<ChainValidationResult, VerifyError> {
-    let certs = parse_cert_chain_pem(chain_pem)?;
-    validate_tpm_cert_chain(&certs, time)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,8 +492,8 @@ mod tests {
     fn test_hash_public_key() {
         let pubkey = [0x04, 0x01, 0x02, 0x03];
         let hash = hash_public_key(&pubkey);
-        // SHA-256 of [0x04, 0x01, 0x02, 0x03]
-        assert_eq!(hash.len(), 64); // 32 bytes = 64 hex chars
+        // SHA-256 returns 32 bytes
+        assert_eq!(hash.len(), 32);
     }
 
     #[test]
@@ -658,9 +576,12 @@ mod tests {
                    SGVsbG8=\n\
                    -----END CERTIFICATE-----";
         let result = parse_cert_chain_pem(pem);
-        assert!(
-            matches!(result, Err(VerifyError::CertificateParse(ref msg)) if msg.contains("Unexpected content"))
-        );
+        assert!(matches!(
+            result,
+            Err(VerifyError::CertificateParse(
+                CertificateParseReason::UnexpectedContent { .. }
+            ))
+        ),);
     }
 
     #[test]
@@ -676,9 +597,12 @@ mod tests {
                    -----END CERTIFICATE-----";
         let result = parse_cert_chain_pem(pem);
         // Will fail on invalid DER, not on parsing
-        assert!(
-            matches!(result, Err(VerifyError::CertificateParse(ref msg)) if msg.contains("DER"))
-        );
+        assert!(matches!(
+            result,
+            Err(VerifyError::CertificateParse(
+                CertificateParseReason::InvalidDer(_)
+            ))
+        ),);
     }
 
     #[test]
@@ -690,9 +614,12 @@ mod tests {
                    V29ybGQ=\n\
                    -----END CERTIFICATE-----";
         let result = parse_cert_chain_pem(pem);
-        assert!(
-            matches!(result, Err(VerifyError::CertificateParse(ref msg)) if msg.contains("Unexpected BEGIN"))
-        );
+        assert!(matches!(
+            result,
+            Err(VerifyError::CertificateParse(
+                CertificateParseReason::NestedBeginMarker { .. }
+            ))
+        ),);
     }
 
     #[test]
@@ -700,9 +627,12 @@ mod tests {
         // END marker without BEGIN should be rejected
         let pem = "-----END CERTIFICATE-----";
         let result = parse_cert_chain_pem(pem);
-        assert!(
-            matches!(result, Err(VerifyError::CertificateParse(ref msg)) if msg.contains("without matching BEGIN"))
-        );
+        assert!(matches!(
+            result,
+            Err(VerifyError::CertificateParse(
+                CertificateParseReason::EndWithoutBegin { .. }
+            ))
+        ),);
     }
 
     #[test]
@@ -711,9 +641,12 @@ mod tests {
         let pem = "-----BEGIN CERTIFICATE-----\n\
                    SGVsbG8=\n";
         let result = parse_cert_chain_pem(pem);
-        assert!(
-            matches!(result, Err(VerifyError::CertificateParse(ref msg)) if msg.contains("missing END"))
-        );
+        assert!(matches!(
+            result,
+            Err(VerifyError::CertificateParse(
+                CertificateParseReason::UnclosedBlock
+            ))
+        ),);
     }
 
     #[test]
