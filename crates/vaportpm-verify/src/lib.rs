@@ -297,9 +297,9 @@ pub struct VerificationResult {
 /// # Returns
 /// A unified `VerificationResult` containing:
 /// - `nonce`: The verified challenge (from TPM2_Quote.extraData)
-/// - `provider`: Cloud provider (AWS/GCP) if root CA is recognized
-/// - `pcrs`: PCR values from the attestation
-/// - `root_pubkey_hash`: SHA-256 of the trust anchor's public key
+/// - `provider`: Cloud provider (AWS/GCP) identified via root CA hash
+/// - `pcrs`: Validated PCR bank from the attestation
+/// - `verified_at`: Verification timestamp (Unix seconds)
 ///
 /// # Errors
 /// Returns `NoValidAttestation` if no supported verification path is available.
@@ -329,6 +329,8 @@ pub fn verify_attestation_json(json: &str) -> Result<VerificationResult, VerifyE
 mod ephemeral_gcp_tests;
 #[cfg(test)]
 mod ephemeral_nitro_tests;
+#[cfg(test)]
+mod flat_tests;
 
 #[cfg(test)]
 mod tests {
