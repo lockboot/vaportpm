@@ -1,6 +1,6 @@
 # RISC Zero ZK Verification Experiment
 
-This experiment runs `verify_attestation_output` inside RISC Zero zkVM to measure cycle counts and understand complexity.
+This experiment runs `verify_decoded_attestation_output` inside RISC Zero zkVM to measure cycle counts and understand complexity.
 
 ## Prerequisites
 
@@ -35,26 +35,36 @@ RISC0_DEV_MODE=1 cargo test -- --nocapture
 ### Expected Output
 
 ```
-=== GCP Attestation Verification ===
-Total cycles: 1998559
-Segments: 3
+=== GCP Attestation Verification (Optimized + zerocopy) ===
+Flat input size: 5792 bytes
+Total cycles: 882866
+Segments: 2
 
-=== Nitro Attestation Verification ===
-Total cycles: 5027644
-Segments: 6
+=== Nitro Attestation Verification (Optimized + zerocopy) ===
+Flat input size: 6446 bytes
+Total cycles: 4177180
+Segments: 5
 ```
+
+## Host-to-Guest Communication
+
+Attestation data is passed from host to guest using an internal flat binary format (`vaportpm_verify::flat`). This avoids JSON parsing and hex decoding inside the zkVM, which would waste cycles on string manipulation rather than cryptographic verification.
+
+The host performs all text parsing (JSON, hex, PEM) upfront, converts to `DecodedAttestationOutput`, then serializes via `flat::to_bytes()`. The guest deserializes with `flat::from_bytes()` and calls `verify_decoded_attestation_output()` — the same verification function used by the native path. The flat format uses a zerocopy header for zero-allocation parsing of fixed fields.
 
 ## Public Inputs
 
-The ZK circuit commits the following public inputs:
+The ZK circuit commits the following public inputs to the journal:
 
-| Field | Size | Description |
+| Field | Type | Description |
 |-------|------|-------------|
-| `pcr_hash` | 32 bytes | SHA256 of canonically-serialized PCRs |
-| `ak_pubkey` | 65 bytes | P-256 uncompressed: `0x04 \|\| x \|\| y` |
-| `nonce` | 32 bytes | Freshness nonce |
-| `provider` | 1 byte | 0 = AWS, 1 = GCP |
-| `root_pubkey_hash` | 32 bytes | SHA256 of root CA public key |
+| `pcr_hash` | `[u8; 32]` | SHA-256 of canonically-serialized PCR bank |
+| `ak_pubkey` | `P256PublicKey` | AK public key (P-256 x/y coordinates) |
+| `nonce` | `[u8; 32]` | Freshness nonce from TPM Quote |
+| `provider` | `u8` | 0 = AWS, 1 = GCP |
+| `verified_at` | `u64` | Verification timestamp (Unix seconds) |
+
+The `pcr_hash` is computed inside the guest as `SHA256(alg_u16_le || count || idx0 || value0 || idx1 || value1 || ...)` over the validated PCR bank, providing a compact commitment to all 24 PCR values.
 
 ## Structure
 
@@ -68,7 +78,8 @@ experiments/risc-zero/
 │   ├── host.rs             # Host utilities
 │   └── inputs.rs           # ZkPublicInputs type
 ├── tests/
-│   └── cycle_count.rs      # Integration tests
+│   ├── cycle_count.rs      # Integration tests (cycle measurement)
+│   └── ec_benchmarks.rs    # EC operation benchmarks
 └── methods/
     ├── Cargo.toml          # Methods crate
     ├── build.rs            # Embeds guest ELF
@@ -80,17 +91,18 @@ experiments/risc-zero/
 
 ## How It Works
 
-1. The **guest program** (`methods/guest/src/main.rs`) runs inside the zkVM:
-   - Reads attestation JSON and timestamp from host
-   - Calls `verify_attestation_output()` (same verification as native)
-   - Computes canonical PCR hash
-   - Commits public inputs to the journal
-
-2. The **host** (`tests/cycle_count.rs`) provides inputs and measures cycles:
+1. The **host** (`tests/cycle_count.rs`) prepares inputs and measures cycles:
    - Loads test fixtures (GCP AMD and Nitro attestations)
-   - Builds executor environment with inputs
-   - Runs guest in dev mode (no real proofs)
-   - Reports cycle counts per segment
+   - Parses JSON and decodes hex/PEM on the host side
+   - Serializes to flat binary format via `flat::to_bytes()` with appended timestamp
+   - Runs the guest in dev mode (no real proofs) and reports cycle counts
+
+2. The **guest program** (`methods/guest/src/main.rs`) runs inside the zkVM:
+   - Reads flat binary input via `env::stdin()`
+   - Parses with `flat::from_bytes()` (zerocopy header, no allocations for fixed fields)
+   - Calls `verify_decoded_attestation_output()` (identical verification to native)
+   - Computes canonical PCR hash over the validated bank
+   - Commits public inputs to the journal
 
 ## Accelerated Cryptography
 
@@ -114,18 +126,15 @@ AWS Nitro uses **P-384 ECDSA** exclusively for its certificate chain. This exper
 
 The P-384 patch is included as a git submodule at `rustcrypto-elliptic-curves/`, tracking the `risc0-p256-p384-unified` branch from the fork.
 
-#### Why Nitro is ~2.5x slower than GCP
+### Why Nitro is ~4.7x slower than GCP
 
-Nitro attestation requires **5 P-384 ECDSA verifications**:
-- 1 COSE signature verification (attestation document)
-- 4 certificate chain verifications (leaf → instance → zonal → regional → root)
+Both P-256 and P-384 have precompile acceleration, but the cost difference comes from volume. Nitro requires **5 P-384 ECDSA verifications**:
+- 1 COSE signature verification (~1M cycles: ~400k P-384 verify + ~570k SHA-512 over COSE document)
+- 4 certificate chain verifications (~400k cycles each)
 
-Each P-384 verification costs ~400-500k cycles. The breakdown from profiling:
-- P-384 EC scalar multiplication: ~30% of total cycles
-- SHA-512 (used by SHA-384): ~15% of total cycles
-- Bigint operations: ~29% of total cycles
+GCP uses RSA-4096 (cheap with dedicated precompile) and a single P-256 ECDSA verification (~250k cycles), keeping the total well under 1M cycles.
 
-GCP uses RSA-4096 (which has a dedicated precompile) and P-256, requiring fewer expensive operations.
+Batch multi-scalar multiplication could theoretically help, but ECDSA verify requires independent scalar muls per signature (different messages and keys), and the RISC Zero precompile interface doesn't expose batching. This is effectively the floor for Nitro's chain structure.
 
 ## Notes
 
@@ -133,12 +142,12 @@ GCP uses RSA-4096 (which has a dedicated precompile) and P-256, requiring fewer 
 - Uses dev mode for fast iteration (no real proofs generated)
 - The main project is completely unchanged
 - Cycle counts give rough indication of proving cost
-- GCP verification is production-viable at ~2M cycles
-- Nitro verification is viable at ~5M cycles with P-384 acceleration (pending upstream merge)
+- GCP verification is production-viable at ~883K cycles (2 segments)
+- Nitro verification is viable at ~4.2M cycles with P-384 acceleration (pending upstream merge)
 
 ## Dependencies
 
-This experiment requires the P-384 accelerated elliptic-curves fork. After cloning, initialize the submodule:
+This experiment requires the P-384 accelerated elliptic-curves fork which hasn't yet been upstreamed to RISC-Zero. After cloning, initialize the submodule:
 
 ```bash
 git submodule update --init --recursive
