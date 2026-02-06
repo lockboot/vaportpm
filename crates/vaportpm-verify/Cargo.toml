@@ -38,6 +38,8 @@ zerocopy = { workspace = true }
 
 [dev-dependencies]
 rcgen = "0.13"
+p256 = { workspace = true, features = ["pkcs8"] }
+p384 = { workspace = true, features = ["pkcs8"] }
 
 [lib]
 name = "vaportpm_verify"
@@ -46,4 +48,3 @@ path = "src/lib.rs"
 [[bin]]
 name = "vaportpm-verify"
 path = "src/bin/verify.rs"
-

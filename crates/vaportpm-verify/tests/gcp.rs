@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use der::Decode;
 use vaportpm_verify::{
-    verify_attestation_output, verify_decoded_attestation_output, CloudProvider,
-    DecodedAttestationOutput, DecodedPlatformAttestation, EccPublicKeyCoords, UnixTime,
-    VerifyError,
+    verify_attestation_output, verify_decoded_attestation_output, CertificateParseReason,
+    ChainValidationReason, CloudProvider, DecodedAttestationOutput, DecodedPlatformAttestation,
+    EccPublicKeyCoords, InvalidAttestReason, SignatureInvalidReason, UnixTime, VerifyError,
 };
 
 use vaportpm_verify::AttestationOutput;
@@ -104,7 +104,12 @@ fn test_gcp_reject_tampered_ak_public_key() {
 
     let result = verify_attestation_output(&output, gcp_amd_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::SignatureInvalid(ref msg)) if msg.contains("AK public key mismatch")),
+        matches!(
+            result,
+            Err(VerifyError::SignatureInvalid(
+                SignatureInvalidReason::AkPublicKeyMismatch
+            ))
+        ),
         "Should reject tampered AK public key, got: {:?}",
         result
     );
@@ -132,7 +137,12 @@ fn test_gcp_reject_tampered_pcr_value() {
 
     let result = verify_attestation_output(&output, gcp_amd_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::InvalidAttest(ref msg)) if msg.contains("PCR digest mismatch")),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::PcrDigestMismatch
+            ))
+        ),
         "Should reject tampered PCR value, got: {:?}",
         result
     );
@@ -214,7 +224,12 @@ fn test_gcp_reject_tampered_nonce_correct_length() {
 
     let result = verify_attestation_output(&output, gcp_amd_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::InvalidAttest(ref msg)) if msg.contains("Nonce does not match")),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::NonceMismatch
+            ))
+        ),
         "Should reject nonce that doesn't match Quote extraData, got: {:?}",
         result
     );
@@ -246,7 +261,12 @@ fn test_gcp_reject_non_sha256_pcrs() {
 
     let result = verify_attestation_output(&output, gcp_amd_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::InvalidAttest(ref msg)) if msg.contains("SHA-256")),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::UnexpectedPcrAlgorithmGcp { .. }
+            ))
+        ),
         "Should reject attestation with non-SHA-256 PCRs, got: {:?}",
         result
     );
@@ -271,7 +291,12 @@ fn test_gcp_reject_missing_pcr() {
 
     let result = verify_attestation_output(&output, gcp_amd_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::InvalidAttest(ref msg)) if msg.contains("all 24 PCRs")),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::MissingPcr { .. }
+            ))
+        ),
         "Should reject when a PCR is missing, got: {:?}",
         result
     );
@@ -337,7 +362,12 @@ fn test_gcp_reject_cert_not_yet_valid() {
 
     let result = verify_attestation_output(&output, past_time);
     assert!(
-        matches!(result, Err(VerifyError::ChainValidation(ref msg)) if msg.contains("not yet valid")),
+        matches!(
+            result,
+            Err(VerifyError::ChainValidation(
+                ChainValidationReason::CertNotYetValid { .. }
+            ))
+        ),
         "Should reject cert not yet valid, got: {:?}",
         result
     );
@@ -358,7 +388,12 @@ fn test_gcp_reject_cert_expired() {
 
     let result = verify_attestation_output(&output, future_time);
     assert!(
-        matches!(result, Err(VerifyError::ChainValidation(ref msg)) if msg.contains("expired")),
+        matches!(
+            result,
+            Err(VerifyError::ChainValidation(
+                ChainValidationReason::CertExpired { .. }
+            ))
+        ),
         "Should reject expired cert, got: {:?}",
         result
     );
@@ -387,7 +422,12 @@ fn test_gcp_decoded_reject_empty_cert_chain() {
 
     let result = verify_decoded_attestation_output(&decoded, gcp_amd_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::ChainValidation(ref msg)) if msg.contains("Empty certificate chain")),
+        matches!(
+            result,
+            Err(VerifyError::ChainValidation(
+                ChainValidationReason::EmptyChain
+            ))
+        ),
         "Should reject empty cert chain in decoded path, got: {:?}",
         result
     );
@@ -405,7 +445,12 @@ fn test_gcp_decoded_reject_invalid_der_cert() {
 
     let result = verify_decoded_attestation_output(&decoded, gcp_amd_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::CertificateParse(ref msg)) if msg.contains("Invalid DER cert")),
+        matches!(
+            result,
+            Err(VerifyError::CertificateParse(
+                CertificateParseReason::InvalidDer(_)
+            ))
+        ),
         "Should reject invalid DER cert, got: {:?}",
         result
     );
@@ -471,7 +516,12 @@ fn test_gcp_decoded_reject_unknown_root_ca() {
 
     let result = verify_decoded_attestation_output(&decoded, gcp_amd_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::ChainValidation(ref msg)) if msg.contains("Unknown root CA")),
+        matches!(
+            result,
+            Err(VerifyError::ChainValidation(
+                ChainValidationReason::UnknownRootCa { .. }
+            ))
+        ),
         "Should reject unknown root CA, got: {:?}",
         result
     );

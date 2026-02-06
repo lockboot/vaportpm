@@ -9,9 +9,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use vaportpm_verify::{
-    verify_attestation_output, verify_decoded_attestation_output, CloudProvider,
-    DecodedAttestationOutput, DecodedPlatformAttestation, EccPublicKeyCoords, UnixTime,
-    VerifyError,
+    verify_attestation_output, verify_decoded_attestation_output, ChainValidationReason,
+    CloudProvider, DecodedAttestationOutput, DecodedPlatformAttestation, EccPublicKeyCoords,
+    InvalidAttestReason, UnixTime, VerifyError,
 };
 
 use vaportpm_verify::AttestationOutput;
@@ -99,7 +99,12 @@ fn test_nitro_reject_tampered_nonce_wrong_length() {
 
     let result = verify_attestation_output(&output, nitro_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::InvalidAttest(_))),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::NonceLengthInvalid
+            ))
+        ),
         "Should reject wrong-length nonce, got: {:?}",
         result
     );
@@ -120,7 +125,12 @@ fn test_nitro_reject_tampered_nonce_correct_length() {
 
     let result = verify_attestation_output(&output, nitro_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::InvalidAttest(ref msg)) if msg.contains("Nonce does not match")),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::NonceMismatch
+            ))
+        ),
         "Should reject nonce that doesn't match Quote extraData, got: {:?}",
         result
     );
@@ -228,7 +238,12 @@ fn test_nitro_reject_cert_not_yet_valid() {
 
     let result = verify_attestation_output(&output, past_time);
     assert!(
-        matches!(result, Err(VerifyError::ChainValidation(ref msg)) if msg.contains("not yet valid")),
+        matches!(
+            result,
+            Err(VerifyError::ChainValidation(
+                ChainValidationReason::CertNotYetValid { .. }
+            ))
+        ),
         "Should reject cert not yet valid, got: {:?}",
         result
     );
@@ -246,7 +261,12 @@ fn test_nitro_reject_cert_expired() {
 
     let result = verify_attestation_output(&output, future_time);
     assert!(
-        matches!(result, Err(VerifyError::ChainValidation(ref msg)) if msg.contains("expired")),
+        matches!(
+            result,
+            Err(VerifyError::ChainValidation(
+                ChainValidationReason::CertExpired { .. }
+            ))
+        ),
         "Should reject expired cert, got: {:?}",
         result
     );
@@ -277,7 +297,12 @@ fn test_nitro_reject_non_sha384_pcrs() {
 
     let result = verify_attestation_output(&output, nitro_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::InvalidAttest(ref msg)) if msg.contains("SHA-384")),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::UnexpectedPcrAlgorithmNitro { .. }
+            ))
+        ),
         "Should reject attestation with non-SHA-384 PCRs, got: {:?}",
         result
     );
@@ -302,7 +327,12 @@ fn test_nitro_reject_extra_sha256_pcrs() {
 
     let result = verify_attestation_output(&output, nitro_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::InvalidAttest(ref msg)) if msg.contains("non-SHA-384")),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::UnexpectedPcrAlgorithmNitro { .. }
+            ))
+        ),
         "Should reject attestation with extra SHA-256 PCRs alongside SHA-384, got: {:?}",
         result
     );
@@ -363,7 +393,12 @@ fn test_nitro_decoded_reject_empty_pcrs() {
 
     let result = verify_decoded_attestation_output(&decoded, nitro_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::InvalidAttest(ref msg)) if msg.contains("Missing SHA-384 PCRs")),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::MissingSha384Pcrs
+            ))
+        ),
         "Should reject empty PCRs, got: {:?}",
         result
     );
@@ -392,7 +427,12 @@ fn test_nitro_decoded_reject_non_sha384_pcr() {
 
     let result = verify_decoded_attestation_output(&decoded, nitro_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::InvalidAttest(ref msg)) if msg.contains("non-SHA-384")),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::UnexpectedPcrAlgorithmNitro { .. }
+            ))
+        ),
         "Should reject non-SHA-384 PCRs at decoded level, got: {:?}",
         result
     );
@@ -410,7 +450,12 @@ fn test_nitro_decoded_reject_pcr_index_out_of_range() {
 
     let result = verify_decoded_attestation_output(&decoded, nitro_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::InvalidAttest(ref msg)) if msg.contains("out of range")),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::PcrIndexOutOfRange { .. }
+            ))
+        ),
         "Should reject PCR index > 23, got: {:?}",
         result
     );
@@ -428,7 +473,12 @@ fn test_nitro_decoded_reject_missing_pcr() {
 
     let result = verify_decoded_attestation_output(&decoded, nitro_fixture_time());
     assert!(
-        matches!(result, Err(VerifyError::InvalidAttest(ref msg)) if msg.contains("all 24 PCRs")),
+        matches!(
+            result,
+            Err(VerifyError::InvalidAttest(
+                InvalidAttestReason::MissingPcr { .. }
+            ))
+        ),
         "Should reject missing SHA-384 PCR, got: {:?}",
         result
     );

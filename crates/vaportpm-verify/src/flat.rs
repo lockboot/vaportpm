@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use crate::error::InvalidAttestReason;
 use crate::{DecodedAttestationOutput, DecodedPlatformAttestation, VerifyError};
 
 /// Platform type constants
@@ -89,16 +90,16 @@ pub fn to_bytes(decoded: &DecodedAttestationOutput) -> Vec<u8> {
 /// Parse flat binary format using zerocopy for header
 pub fn from_bytes(data: &[u8]) -> Result<DecodedAttestationOutput, VerifyError> {
     if data.len() < HEADER_SIZE {
-        return Err(VerifyError::InvalidAttest(format!(
-            "input too short: {} < {}",
-            data.len(),
-            HEADER_SIZE
-        )));
+        return Err(InvalidAttestReason::InputTooShort {
+            actual: data.len(),
+            minimum: HEADER_SIZE,
+        }
+        .into());
     }
 
     // Zero-copy header parsing!
-    let (header, _suffix) = FlatHeader::ref_from_prefix(data)
-        .map_err(|_| VerifyError::InvalidAttest("failed to parse header".into()))?;
+    let (header, _suffix) =
+        FlatHeader::ref_from_prefix(data).map_err(|_| InvalidAttestReason::FlatHeaderInvalid)?;
 
     let quote_attest_len = header.quote_attest_len as usize;
     let quote_signature_len = header.quote_signature_len as usize;
@@ -111,7 +112,10 @@ pub fn from_bytes(data: &[u8]) -> Result<DecodedAttestationOutput, VerifyError> 
     let mut pcrs = BTreeMap::new();
     for _ in 0..pcr_count {
         if offset + 3 > data.len() {
-            return Err(VerifyError::InvalidAttest("truncated PCR header".into()));
+            return Err(InvalidAttestReason::FlatTruncated {
+                field: "PCR header",
+            }
+            .into());
         }
         let alg_id = data[offset];
         let pcr_idx = data[offset + 1];
@@ -119,7 +123,7 @@ pub fn from_bytes(data: &[u8]) -> Result<DecodedAttestationOutput, VerifyError> 
         offset += 3;
 
         if offset + value_len > data.len() {
-            return Err(VerifyError::InvalidAttest("truncated PCR value".into()));
+            return Err(InvalidAttestReason::FlatTruncated { field: "PCR value" }.into());
         }
         pcrs.insert((alg_id, pcr_idx), data[offset..offset + value_len].to_vec());
         offset += value_len;
@@ -127,29 +131,39 @@ pub fn from_bytes(data: &[u8]) -> Result<DecodedAttestationOutput, VerifyError> 
 
     // Parse quote data
     if offset + quote_attest_len > data.len() {
-        return Err(VerifyError::InvalidAttest("truncated quote_attest".into()));
+        return Err(InvalidAttestReason::FlatTruncated {
+            field: "quote_attest",
+        }
+        .into());
     }
     let quote_attest = data[offset..offset + quote_attest_len].to_vec();
     offset += quote_attest_len;
 
     if offset + quote_signature_len > data.len() {
-        return Err(VerifyError::InvalidAttest(
-            "truncated quote_signature".into(),
-        ));
+        return Err(InvalidAttestReason::FlatTruncated {
+            field: "quote_signature",
+        }
+        .into());
     }
     let quote_signature = data[offset..offset + quote_signature_len].to_vec();
     offset += quote_signature_len;
 
     // Parse platform data
     if offset + platform_data_len > data.len() {
-        return Err(VerifyError::InvalidAttest("truncated platform data".into()));
+        return Err(InvalidAttestReason::FlatTruncated {
+            field: "platform data",
+        }
+        .into());
     }
     let platform_bytes = &data[offset..offset + platform_data_len];
 
     let platform = match header.platform_type {
         PLATFORM_GCP => {
             if platform_bytes.is_empty() {
-                return Err(VerifyError::InvalidAttest("empty GCP platform data".into()));
+                return Err(InvalidAttestReason::FlatTruncated {
+                    field: "GCP platform data",
+                }
+                .into());
             }
             let cert_count = platform_bytes[0] as usize;
             let mut poffset = 1;
@@ -157,7 +171,10 @@ pub fn from_bytes(data: &[u8]) -> Result<DecodedAttestationOutput, VerifyError> 
             let mut cert_lens = Vec::with_capacity(cert_count);
             for _ in 0..cert_count {
                 if poffset + 2 > platform_bytes.len() {
-                    return Err(VerifyError::InvalidAttest("truncated cert length".into()));
+                    return Err(InvalidAttestReason::FlatTruncated {
+                        field: "cert length",
+                    }
+                    .into());
                 }
                 let len =
                     u16::from_le_bytes(platform_bytes[poffset..poffset + 2].try_into().unwrap())
@@ -169,7 +186,7 @@ pub fn from_bytes(data: &[u8]) -> Result<DecodedAttestationOutput, VerifyError> 
             let mut cert_chain_der = Vec::with_capacity(cert_count);
             for len in cert_lens {
                 if poffset + len > platform_bytes.len() {
-                    return Err(VerifyError::InvalidAttest("truncated cert data".into()));
+                    return Err(InvalidAttestReason::FlatTruncated { field: "cert data" }.into());
                 }
                 cert_chain_der.push(platform_bytes[poffset..poffset + len].to_vec());
                 poffset += len;
@@ -181,10 +198,10 @@ pub fn from_bytes(data: &[u8]) -> Result<DecodedAttestationOutput, VerifyError> 
             document: platform_bytes.to_vec(),
         },
         _ => {
-            return Err(VerifyError::InvalidAttest(format!(
-                "unknown platform type: {}",
-                header.platform_type
-            )))
+            return Err(InvalidAttestReason::UnknownPlatformType {
+                platform_type: header.platform_type,
+            }
+            .into())
         }
     };
 

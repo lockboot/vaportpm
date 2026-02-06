@@ -20,8 +20,12 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 
-// Re-export error type
-pub use error::VerifyError;
+// Re-export error types
+pub use error::{
+    CborParseReason, CertificateParseReason, ChainValidationReason, CoseVerifyReason,
+    InvalidAttestReason, NoValidAttestationReason, PcrIndexOutOfBoundsReason,
+    SignatureInvalidReason, VerifyError,
+};
 
 // Re-export TPM types and functions (only those used by verification paths)
 pub use tpm::{parse_quote_attest, verify_ecdsa_p256, verify_pcr_digest_matches, TpmQuoteInfo};
@@ -81,7 +85,55 @@ pub mod roots {
         } else if hash == &GCP_EKAK_ROOT_HASH {
             Some(CloudProvider::Gcp)
         } else {
+            #[cfg(test)]
+            {
+                if let Some(provider) = test_registry::lookup_test_root(hash) {
+                    return Some(provider);
+                }
+            }
             None
+        }
+    }
+
+    #[cfg(test)]
+    pub use test_registry::{register_test_root, TestRootGuard};
+
+    #[cfg(test)]
+    mod test_registry {
+        use super::CloudProvider;
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+
+        thread_local! {
+            static TEST_ROOTS: RefCell<HashMap<[u8; 32], CloudProvider>> =
+                RefCell::new(HashMap::new());
+        }
+
+        /// RAII guard that removes a test root on drop (even on panic).
+        pub struct TestRootGuard {
+            hash: [u8; 32],
+        }
+
+        impl Drop for TestRootGuard {
+            fn drop(&mut self) {
+                TEST_ROOTS.with(|roots| {
+                    roots.borrow_mut().remove(&self.hash);
+                });
+            }
+        }
+
+        /// Register an ephemeral root CA hash for testing.
+        /// Returns an RAII guard that removes the entry on drop.
+        pub fn register_test_root(hash: [u8; 32], provider: CloudProvider) -> TestRootGuard {
+            TEST_ROOTS.with(|roots| {
+                roots.borrow_mut().insert(hash, provider);
+            });
+            TestRootGuard { hash }
+        }
+
+        /// Look up a test root by hash (called from `provider_from_hash`).
+        pub fn lookup_test_root(hash: &[u8; 32]) -> Option<CloudProvider> {
+            TEST_ROOTS.with(|roots| roots.borrow().get(hash).copied())
         }
     }
 }
@@ -131,6 +183,9 @@ pub enum DecodedPlatformAttestation {
 
 pub mod flat;
 
+#[cfg(test)]
+mod test_support;
+
 impl DecodedAttestationOutput {
     /// Decode an AttestationOutput to binary format
     pub fn decode(output: &AttestationOutput) -> Result<Self, VerifyError> {
@@ -139,11 +194,12 @@ impl DecodedAttestationOutput {
         let nonce_bytes = hex::decode(&output.nonce)?;
         let nonce: [u8; 32] = nonce_bytes
             .try_into()
-            .map_err(|_| VerifyError::InvalidAttest("nonce must be 32 bytes".into()))?;
+            .map_err(|_| InvalidAttestReason::NonceLengthInvalid)?;
 
-        let ak_pk = output.ak_pubkeys.get("ecc_p256").ok_or_else(|| {
-            VerifyError::NoValidAttestation("missing ecc_p256 AK public key".into())
-        })?;
+        let ak_pk = output
+            .ak_pubkeys
+            .get("ecc_p256")
+            .ok_or(NoValidAttestationReason::MissingAkPublicKey)?;
         let ak_x = hex::decode(&ak_pk.x)?;
         let ak_y = hex::decode(&ak_pk.y)?;
         let mut ak_pubkey = [0u8; 65];
@@ -151,9 +207,11 @@ impl DecodedAttestationOutput {
         ak_pubkey[1..33].copy_from_slice(&ak_x);
         ak_pubkey[33..65].copy_from_slice(&ak_y);
 
-        let tpm = output.attestation.tpm.get("ecc_p256").ok_or_else(|| {
-            VerifyError::NoValidAttestation("missing ecc_p256 TPM attestation".into())
-        })?;
+        let tpm = output
+            .attestation
+            .tpm
+            .get("ecc_p256")
+            .ok_or(NoValidAttestationReason::MissingTpmAttestation)?;
         let quote_attest = hex::decode(&tpm.attest_data)?;
         let quote_signature = hex::decode(&tpm.signature)?;
 
@@ -176,17 +234,13 @@ impl DecodedAttestationOutput {
                 .iter()
                 .map(|c| c.to_der())
                 .collect::<Result<_, _>>()
-                .map_err(|e| {
-                    VerifyError::CertificateParse(format!("Failed to encode cert as DER: {}", e))
-                })?;
+                .map_err(|e| CertificateParseReason::DerEncodeFailed(e.to_string()))?;
             DecodedPlatformAttestation::Gcp { cert_chain_der }
         } else if let Some(ref nitro) = output.attestation.nitro {
             let document = hex::decode(&nitro.document)?;
             DecodedPlatformAttestation::Nitro { document }
         } else {
-            return Err(VerifyError::NoValidAttestation(
-                "no platform attestation".into(),
-            ));
+            return Err(NoValidAttestationReason::NoPlatform.into());
         };
 
         Ok(DecodedAttestationOutput {
@@ -276,10 +330,15 @@ pub fn verify_attestation_output(
 /// For testing with fixtures that have expired certificates, use
 /// `verify_attestation_output` directly with a specific time.
 pub fn verify_attestation_json(json: &str) -> Result<VerificationResult, VerifyError> {
-    let output: AttestationOutput = serde_json::from_str(json)
-        .map_err(|e| VerifyError::InvalidAttest(format!("JSON parse error: {}", e)))?;
+    let output: AttestationOutput =
+        serde_json::from_str(json).map_err(InvalidAttestReason::JsonParse)?;
     verify_attestation_output(&output, UnixTime::now())
 }
+
+#[cfg(test)]
+mod ephemeral_gcp_tests;
+#[cfg(test)]
+mod ephemeral_nitro_tests;
 
 #[cfg(test)]
 mod tests {
