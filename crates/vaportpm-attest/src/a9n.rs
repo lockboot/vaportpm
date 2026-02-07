@@ -14,8 +14,6 @@ use std::collections::{BTreeMap, HashMap};
 use crate::cert::{der_to_pem, fetch_cert_chain, DER_SEQUENCE_LONG};
 use crate::{KeyOps, NsmOps, NvOps, PcrOps, PublicKey, Tpm, TPM_RH_ENDORSEMENT};
 
-/// GCP AK template NV index (RSA) - used for GCP detection
-const GCP_AK_TEMPLATE_NV_INDEX_RSA: u32 = 0x01c10001;
 /// GCP AK certificate NV index (ECC)
 const GCP_AK_CERT_NV_INDEX_ECC: u32 = 0x01c10002;
 /// GCP AK template NV index (ECC)
@@ -95,8 +93,7 @@ pub struct NitroAttestationData {
 /// same NV indices and use the GCP attestation path without needing a
 /// "GOOG" manufacturer ID.
 fn is_gcp_tpm(tpm: &mut Tpm) -> bool {
-    tpm.nv_readpublic(GCP_AK_TEMPLATE_NV_INDEX_RSA).is_ok()
-        && tpm.nv_readpublic(GCP_AK_TEMPLATE_NV_INDEX_ECC).is_ok()
+    tpm.nv_readpublic(GCP_AK_TEMPLATE_NV_INDEX_ECC).is_ok()
         && tpm.nv_readpublic(GCP_AK_CERT_NV_INDEX_ECC).is_ok()
 }
 
