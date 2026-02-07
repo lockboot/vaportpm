@@ -20,10 +20,6 @@ const GCP_AK_TEMPLATE_NV_INDEX_RSA: u32 = 0x01c10001;
 const GCP_AK_CERT_NV_INDEX_ECC: u32 = 0x01c10002;
 /// GCP AK template NV index (ECC)
 const GCP_AK_TEMPLATE_NV_INDEX_ECC: u32 = 0x01c10003;
-/// GCP TPM manufacturer ID: "GOOG"
-const GCP_MANUFACTURER_GOOG: u32 = 0x474F4F47;
-/// TPM property: manufacturer
-const TPM_PT_MANUFACTURER: u32 = 0x00000105;
 
 /// Result type for attestation helper functions
 /// Contains: (ak_pubkeys, attestation_data, gcp_attestation, ak_handle)
@@ -92,22 +88,16 @@ pub struct NitroAttestationData {
     pub document: String,
 }
 
-/// Detect if running on GCP Shielded VM
+/// Detect if running on a GCP-compatible TPM
 ///
-/// Detection based on:
-/// 1. TPM manufacturer ID is "GOOG"
-/// 2. GCP AK template NV index exists
+/// Uses duck typing: if the expected GCP NV indices exist, treat it as GCP.
+/// This allows test TPMs (e.g. swtpm in QEMU) to be provisioned with the
+/// same NV indices and use the GCP attestation path without needing a
+/// "GOOG" manufacturer ID.
 fn is_gcp_tpm(tpm: &mut Tpm) -> bool {
-    // Check manufacturer
-    if let Ok(manufacturer) = tpm.get_property(TPM_PT_MANUFACTURER) {
-        if manufacturer == GCP_MANUFACTURER_GOOG {
-            // Verify AK template exists
-            if tpm.nv_readpublic(GCP_AK_TEMPLATE_NV_INDEX_RSA).is_ok() {
-                return true;
-            }
-        }
-    }
-    false
+    tpm.nv_readpublic(GCP_AK_TEMPLATE_NV_INDEX_RSA).is_ok()
+        && tpm.nv_readpublic(GCP_AK_TEMPLATE_NV_INDEX_ECC).is_ok()
+        && tpm.nv_readpublic(GCP_AK_CERT_NV_INDEX_ECC).is_ok()
 }
 
 /// Generate a complete TPM attestation document
