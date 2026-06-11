@@ -5,6 +5,7 @@
 //! Extension trait providing PCR-related functionality for TPM.
 
 use crate::{CommandBuffer, Tpm, TpmAlg, TpmCc, TpmSt, TPM_CAP_PCRS};
+use alloc::vec::Vec;
 use anyhow::{bail, Result};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
