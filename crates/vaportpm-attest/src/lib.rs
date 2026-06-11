@@ -462,7 +462,7 @@ impl ResponseBuffer {
 /// `EFI_TCG2_PROTOCOL.SubmitCommand` in a UEFI environment. The implementor is
 /// responsible only for delivering the command and returning the complete
 /// response (10-byte header + body); header validation and response-code
-/// checking are handled by [`Tpm::transmit`].
+/// checking are handled by the [`Tpm`] wrapper.
 pub trait TpmTransport {
     /// Send a fully-framed TPM command and return the complete response bytes
     /// (TPM response header followed by its body).
@@ -560,7 +560,10 @@ impl Tpm {
         let response = self.transport.transmit_raw(command)?;
 
         if response.len() < 10 {
-            bail!("Invalid TPM response: {} bytes (need at least 10)", response.len());
+            bail!(
+                "Invalid TPM response: {} bytes (need at least 10)",
+                response.len()
+            );
         }
 
         // Parse response header (first 10 bytes)
@@ -578,7 +581,9 @@ impl Tpm {
         }
 
         // Return the response body (excluding the 10-byte header)
-        Ok(ResponseBuffer::new(response[10..header.size as usize].to_vec()))
+        Ok(ResponseBuffer::new(
+            response[10..header.size as usize].to_vec(),
+        ))
     }
 
     /// Flush a context (close a handle)
