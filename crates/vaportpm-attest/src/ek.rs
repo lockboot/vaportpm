@@ -7,6 +7,8 @@
 //! - Creating keys from templates (GCP AK)
 //! - TPM2_Quote for PCR attestation
 
+use alloc::vec;
+use alloc::vec::Vec;
 use anyhow::{bail, Result};
 
 use crate::{

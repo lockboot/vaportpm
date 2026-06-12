@@ -6,6 +6,7 @@
 
 use crate::{CommandBuffer, Tpm, TpmCc, TpmSt};
 use crate::{TPM_CAP_HANDLES, TPM_RH_OWNER};
+use alloc::vec::Vec;
 use anyhow::{bail, Result};
 
 /// TPM handle types
@@ -235,7 +236,7 @@ impl NvOps for Tpm {
         let mut offset = 0usize;
 
         while offset < data.len() {
-            let chunk_size = std::cmp::min(MAX_CHUNK, data.len() - offset);
+            let chunk_size = core::cmp::min(MAX_CHUNK, data.len() - offset);
             let chunk = &data[offset..offset + chunk_size];
 
             let command = CommandBuffer::new()

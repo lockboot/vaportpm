@@ -2,28 +2,52 @@
 
 //! Minimal TPM 2.0 protocol implementation
 //!
-//! Direct communication with TPM via /dev/tpmrm0 without any C dependencies.
-//! Based on TPM 2.0 specification for command/response protocol.
+//! TPM 2.0 command/response marshalling without any C dependencies.
+//!
+//! TPM I/O is abstracted behind the [`TpmTransport`] trait. With the default
+//! `std` feature, [`Tpm::open`] talks to a Linux TPM device (`/dev/tpmrm0`).
+//! With `--no-default-features` the crate is `no_std` (requires `alloc`) and
+//! exposes only the transport-agnostic core (command marshalling + PCR ops),
+//! letting a UEFI caller supply a transport over `EFI_TCG2_PROTOCOL`.
 
-use anyhow::{bail, Context, Result};
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use anyhow::{bail, Result};
+
+#[cfg(feature = "std")]
+use anyhow::Context;
+#[cfg(feature = "std")]
 use std::fs::{File, OpenOptions};
+#[cfg(feature = "std")]
 use std::io::{Read, Write};
 
+#[cfg(feature = "std")]
 pub mod a9n;
+#[cfg(feature = "std")]
 pub mod cert;
 pub mod ek;
+#[cfg(feature = "std")]
 pub mod nsm;
 pub mod nv;
 pub mod pcr;
+#[cfg(feature = "std")]
 pub mod roots;
 
 // Re-export extension traits for convenience
 pub use ek::KeyOps;
-pub use nsm::NsmOps;
 pub use nv::NvOps;
 pub use pcr::PcrOps;
 
+#[cfg(feature = "std")]
+pub use nsm::NsmOps;
+
+#[cfg(feature = "std")]
 pub use a9n::attest;
+#[cfg(feature = "std")]
 pub use cert::{der_to_pem, extract_aki, extract_ski, pem_to_der};
 
 /// TPM 2.0 command codes
@@ -344,6 +368,7 @@ impl CommandBuffer {
     }
 
     /// Finalize command with a vendor-specific command code
+    #[cfg(feature = "std")]
     fn finalize_vendor(mut self, tag: TpmSt, vendor_code: u32) -> Vec<u8> {
         let total_size = 10 + self.data.len(); // header is 10 bytes
         let mut result = Vec::new();
@@ -430,17 +455,28 @@ impl ResponseBuffer {
     }
 }
 
-/// TPM 2.0 device context
-pub struct Tpm {
+/// Transport for exchanging raw, fully-framed TPM 2.0 messages.
+///
+/// Implementors move bytes to/from the TPM by whatever mechanism is available:
+/// a Linux device file (see [`FileTransport`]) under `std`, or
+/// `EFI_TCG2_PROTOCOL.SubmitCommand` in a UEFI environment. The implementor is
+/// responsible only for delivering the command and returning the complete
+/// response (10-byte header + body); header validation and response-code
+/// checking are handled by the [`Tpm`] wrapper.
+pub trait TpmTransport {
+    /// Send a fully-framed TPM command and return the complete response bytes
+    /// (TPM response header followed by its body).
+    fn transmit_raw(&mut self, command: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// Linux TPM device-file transport (`/dev/tpmrm0` or `/dev/tpm0`).
+#[cfg(feature = "std")]
+pub struct FileTransport {
     device: File,
 }
 
-impl Tpm {
-    /// Open the TPM device (defaults to /dev/tpmrm0)
-    pub fn open() -> Result<Self> {
-        Self::open_path("/dev/tpmrm0")
-    }
-
+#[cfg(feature = "std")]
+impl FileTransport {
     /// Open a specific TPM device path
     pub fn open_path(path: &str) -> Result<Self> {
         let device = OpenOptions::new()
@@ -451,16 +487,11 @@ impl Tpm {
 
         Ok(Self { device })
     }
+}
 
-    /// Open direct TPM device (/dev/tpm0) - required for vendor commands
-    pub fn open_direct() -> Result<Self> {
-        Self::open_path("/dev/tpm0")
-    }
-
-    /// Send a command and receive response
-    ///
-    /// Returns a ResponseBuffer containing the response body (without the header)
-    pub(crate) fn transmit(&mut self, command: &[u8]) -> Result<ResponseBuffer> {
+#[cfg(feature = "std")]
+impl TpmTransport for FileTransport {
+    fn transmit_raw(&mut self, command: &[u8]) -> Result<Vec<u8>> {
         // Write command
         self.device
             .write_all(command)
@@ -472,26 +503,87 @@ impl Tpm {
             .read_exact(&mut header_buf)
             .context("Failed to read TPM response header")?;
 
-        // Parse response header
         let header = TpmResponseHeader::from_bytes(&header_buf);
-
         if header.size < 10 {
             bail!("Invalid TPM response size: {}", header.size);
         }
 
-        // Read response body (excluding header)
+        // Read response body (excluding header) and return the full response
         let body_size = header.size as usize - 10;
-        let mut body = vec![0u8; body_size];
+        let mut response = Vec::with_capacity(header.size as usize);
+        response.extend_from_slice(&header_buf);
+        let mut body = alloc::vec![0u8; body_size];
         self.device
             .read_exact(&mut body)
             .context("Failed to read TPM response body")?;
+        response.extend_from_slice(&body);
+
+        Ok(response)
+    }
+}
+
+/// TPM 2.0 context — marshals commands and dispatches them over a [`TpmTransport`].
+pub struct Tpm {
+    transport: Box<dyn TpmTransport>,
+}
+
+impl Tpm {
+    /// Open the TPM device (defaults to /dev/tpmrm0)
+    #[cfg(feature = "std")]
+    pub fn open() -> Result<Self> {
+        Self::open_path("/dev/tpmrm0")
+    }
+
+    /// Open a specific TPM device path
+    #[cfg(feature = "std")]
+    pub fn open_path(path: &str) -> Result<Self> {
+        Ok(Self::with_transport(Box::new(FileTransport::open_path(
+            path,
+        )?)))
+    }
+
+    /// Open direct TPM device (/dev/tpm0) - required for vendor commands
+    #[cfg(feature = "std")]
+    pub fn open_direct() -> Result<Self> {
+        Self::open_path("/dev/tpm0")
+    }
+
+    /// Build a TPM context over an arbitrary transport (e.g. UEFI TCG2).
+    pub fn with_transport(transport: Box<dyn TpmTransport>) -> Self {
+        Self { transport }
+    }
+
+    /// Send a command and receive response
+    ///
+    /// Returns a ResponseBuffer containing the response body (without the header)
+    pub(crate) fn transmit(&mut self, command: &[u8]) -> Result<ResponseBuffer> {
+        let response = self.transport.transmit_raw(command)?;
+
+        if response.len() < 10 {
+            bail!(
+                "Invalid TPM response: {} bytes (need at least 10)",
+                response.len()
+            );
+        }
+
+        // Parse response header (first 10 bytes)
+        let mut header_buf = [0u8; 10];
+        header_buf.copy_from_slice(&response[..10]);
+        let header = TpmResponseHeader::from_bytes(&header_buf);
+
+        if (header.size as usize) < 10 || header.size as usize > response.len() {
+            bail!("Invalid TPM response size: {}", header.size);
+        }
 
         // Check response code
         if header.code != TpmRc::Success as u32 {
             bail!("TPM command failed with code: 0x{:08X}", header.code);
         }
 
-        Ok(ResponseBuffer::new(body))
+        // Return the response body (excluding the 10-byte header)
+        Ok(ResponseBuffer::new(
+            response[10..header.size as usize].to_vec(),
+        ))
     }
 
     /// Flush a context (close a handle)

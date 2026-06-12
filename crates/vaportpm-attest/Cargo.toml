@@ -5,22 +5,58 @@ edition = "2021"
 description = "Cloud vTPM attestation - minimal TPM 2.0 implementation without C dependencies"
 license.workspace = true
 
+# no_std-capable core dependencies (always compiled).
+# Declared directly (not via workspace) so default-features can be disabled,
+# which is required for the no_std/UEFI build.
 [dependencies]
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-sha1 = { workspace = true }
-sha2 = { workspace = true }
-hmac = { workspace = true }
-base64 = { workspace = true }
-serde = { workspace = true }
-ciborium = { workspace = true }
-serde_bytes = { workspace = true }
-hex = { workspace = true }
-serde_json = { workspace = true }
+anyhow = { version = "1.0", default-features = false }
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
-# X.509 certificate parsing
-der = { workspace = true }
-x509-cert = { workspace = true }
+# std-only dependencies (attestation/quote/cert paths) — gated behind the `std` feature
+thiserror = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+ciborium = { workspace = true, optional = true }
+serde_bytes = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+# X.509 certificate parsing (std-only path)
+der = { workspace = true, optional = true }
+x509-cert = { workspace = true, optional = true }
+
+# On UEFI (soft-float, no SSE) force the portable software hash backends.
+# The optimized SIMD/asm paths emit 128-bit vector ops that LLVM cannot lower
+# for x86_64-unknown-uefi. Cargo unions these features with the base deps, so
+# the Linux build keeps its native fast path.
+[target.'cfg(target_os = "uefi")'.dependencies]
+sha1 = { version = "0.10", default-features = false, features = ["force-soft"] }
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+[features]
+default = ["std"]
+# `std` enables the full attestation surface: TPM device I/O via /dev/tpm*, the
+# quote/AK/cert-chain paths (a9n, cert, roots, nsm) and the CLI binary.
+# With `--no-default-features` only the no_std core remains: the TpmTransport
+# trait, command marshalling and PCR operations (e.g. pcr_extend), suitable for
+# UEFI use over EFI_TCG2_PROTOCOL.
+std = [
+    "anyhow/std",
+    "hex/std",
+    "sha1/std",
+    "sha2/std",
+    "hmac/std",
+    "dep:thiserror",
+    "dep:base64",
+    "dep:serde",
+    "dep:ciborium",
+    "dep:serde_bytes",
+    "dep:serde_json",
+    "dep:der",
+    "dep:x509-cert",
+]
 
 [lib]
 name = "vaportpm_attest"
@@ -29,3 +65,4 @@ path = "src/lib.rs"
 [[bin]]
 name = "vaportpm-attest"
 path = "src/bin/attest.rs"
+required-features = ["std"]
