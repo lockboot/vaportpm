@@ -242,6 +242,13 @@ impl<'a> SafeCursor<'a> {
 ///
 /// The TPM Quote contains a PCR digest (SHA-256 of concatenated PCR values).
 /// PcrBank guarantees all 24 values in order, so we just hash them sequentially.
+///
+/// INVARIANT: the digest is always SHA-256, even when the PCR *bank* is SHA-384
+/// (the Nitro case). A TPM2_Quote computes `pcrDigest` using the hash of the
+/// AK's signing scheme, not the hash of the PCR bank. Both paths use a P-256 AK
+/// signing with ECDSA-SHA256 (see `verify_ecdsa_p256`), so the digest is SHA-256
+/// over the concatenated bank values regardless of bank algorithm. Do NOT switch
+/// this to SHA-384 for the Nitro path — that would break verification.
 pub(crate) fn verify_pcr_digest_matches(
     quote_info: &TpmQuoteInfo,
     pcrs: &PcrBank,

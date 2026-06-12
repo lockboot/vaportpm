@@ -242,8 +242,14 @@ pub enum ChainValidationReason {
     #[error("Leaf certificate missing Key Usage extension")]
     LeafMissingKeyUsage,
 
+    #[error("Certificate {index} (CA) missing Key Usage extension")]
+    CaMissingKeyUsage { index: usize },
+
     #[error("Certificate {index} issuer does not match parent subject")]
     IssuerMismatch { index: usize },
+
+    #[error("Certificate {index} outer signatureAlgorithm does not match inner tbsCertificate.signature")]
+    SignatureAlgorithmMismatch { index: usize },
 
     #[error("Certificate {index} signature verification failed")]
     SignatureVerificationFailed { index: usize },
