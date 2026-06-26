@@ -325,6 +325,52 @@ pub fn verify_attestation_json(json: &str) -> Result<VerificationResult, VerifyE
     verify_attestation_output(&output, UnixTime::now())
 }
 
+/// Guards the trust anchor: the precomputed root public-key hash constants must
+/// stay in sync with the embedded root certificates they claim to represent.
+///
+/// The hashes in `roots` are hardcoded (not derived at runtime) because deriving
+/// them inside the zkVM guest costs significant circuit cycles. That optimization
+/// means nothing at runtime checks they actually match the embedded certs, so the
+/// single point of trust rests on these constants being correct. These tests
+/// re-derive each hash from the embedded PEM and assert equality, turning a silent
+/// landmine into a build-time (CI) failure.
+#[cfg(test)]
+mod root_anchor_tests {
+    use crate::roots::{
+        AWS_NITRO_ROOT_HASH, AWS_NITRO_ROOT_PEM, GCP_EKAK_ROOT_HASH, GCP_EKAK_ROOT_PEM,
+    };
+    use crate::x509::{extract_public_key, hash_public_key, parse_cert_chain_pem};
+
+    /// Re-derive the root public-key hash the same way `validate_tpm_cert_chain`
+    /// does: SHA-256 over the SubjectPublicKey bit-string of the root certificate.
+    fn embedded_root_pubkey_hash(pem: &str) -> [u8; 32] {
+        let certs = parse_cert_chain_pem(pem).expect("embedded root PEM should parse");
+        let root = certs
+            .last()
+            .expect("embedded PEM has at least one certificate");
+        let pubkey = extract_public_key(root).expect("root certificate has a public key");
+        hash_public_key(&pubkey)
+    }
+
+    #[test]
+    fn aws_nitro_root_hash_matches_embedded_cert() {
+        assert_eq!(
+            embedded_root_pubkey_hash(AWS_NITRO_ROOT_PEM),
+            AWS_NITRO_ROOT_HASH,
+            "AWS_NITRO_ROOT_HASH is out of sync with the embedded AWS Nitro root certificate"
+        );
+    }
+
+    #[test]
+    fn gcp_ekak_root_hash_matches_embedded_cert() {
+        assert_eq!(
+            embedded_root_pubkey_hash(GCP_EKAK_ROOT_PEM),
+            GCP_EKAK_ROOT_HASH,
+            "GCP_EKAK_ROOT_HASH is out of sync with the embedded GCP EK/AK root certificate"
+        );
+    }
+}
+
 #[cfg(test)]
 mod ephemeral_gcp_tests;
 #[cfg(test)]

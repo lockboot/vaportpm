@@ -74,6 +74,19 @@ pub(crate) fn extract_key_usage(cert: &Certificate) -> Option<KeyUsageFlags> {
 /// Extract Basic Constraints extension from a certificate (OID 2.5.29.19)
 ///
 /// Returns None if the extension is not present.
+///
+/// This deliberately hand-parses a minimal ASN.1 subset (short-form lengths,
+/// the `cA BOOLEAN` and optional `pathLenConstraint INTEGER`) rather than using
+/// the full `der`/`x509_cert` typed decoder. Two reasons:
+/// 1. Pulling the general DER decoder into the verification path significantly
+///    inflates zkVM circuit size.
+/// 2. A constrained parser over this one known-shape extension is a smaller,
+///    more auditable trust surface than the general decoder.
+///
+/// It is fail-closed by construction: any byte it does not understand yields the
+/// default (`cA = false`), which `validate_tpm_cert_chain` rejects for any
+/// non-leaf certificate. So a malformed Basic Constraints can only cause a CA to
+/// be rejected, never a non-CA to be accepted as a CA.
 pub(crate) fn extract_basic_constraints(cert: &Certificate) -> Option<BasicConstraints> {
     let extensions = cert.tbs_certificate.extensions.as_ref()?;
 
@@ -264,21 +277,26 @@ pub(crate) struct ChainValidationResult {
 /// **Time validity:**
 /// - Certificate validity periods include the specified time
 ///
+/// **signatureAlgorithm consistency (RFC 5280 §4.1.1.2):**
+/// - Each certificate's outer `signatureAlgorithm` must equal its inner
+///   `tbsCertificate.signature`
+///
 /// **Basic Constraints (OID 2.5.29.19):**
 /// - Leaf certificate must have `CA:FALSE` (or no Basic Constraints)
 /// - Intermediate/root certificates must have `CA:TRUE`
 /// - Path length constraints are honored
 ///
 /// **Key Usage (OID 2.5.29.15):**
+/// - Every certificate must carry the Key Usage extension
 /// - Leaf certificate must have `digitalSignature` bit set
 /// - CA certificates must have `keyCertSign` bit set
 ///
-/// **Extended Key Usage (OID 2.5.29.37):**
-/// - CA certificates should have TPM EK Certificate EKU (2.23.133.8.1)
-/// - Note: GCP AK leaf certificates don't have EKU, only Key Usage
-///
 /// **Name chaining:**
 /// - Each certificate's Issuer must match its parent's Subject
+///
+/// Extended Key Usage (OID 2.5.29.37) is intentionally NOT checked: the GCP AK
+/// leaf certificates carry only Key Usage, and `BasicConstraints.cA` is the
+/// authoritative gate for CA capability.
 ///
 /// Chain should be leaf-first, root-last.
 pub(crate) fn validate_tpm_cert_chain(
@@ -302,6 +320,17 @@ pub(crate) fn validate_tpm_cert_chain(
     for (i, cert) in chain.iter().enumerate() {
         let is_leaf = i == 0;
         let is_root = i == chain.len() - 1;
+
+        // 0. signatureAlgorithm consistency (RFC 5280 §4.1.1.2)
+        //
+        // The outer signatureAlgorithm must equal the inner
+        // tbsCertificate.signature. We select the verification algorithm from
+        // the outer field below but verify over the TBS bytes (which carry the
+        // inner field); requiring equality here forecloses any algorithm
+        // substitution between the two.
+        if cert.signature_algorithm != cert.tbs_certificate.signature {
+            return Err(ChainValidationReason::SignatureAlgorithmMismatch { index: i }.into());
+        }
 
         // 1. Basic Constraints validation
         if let Some(bc) = extract_basic_constraints(cert) {
@@ -339,6 +368,14 @@ pub(crate) fn validate_tpm_cert_chain(
         }
 
         // 2. Key Usage validation
+        //
+        // BasicConstraints.cA (checked above) is the *authoritative* gate for
+        // whether a certificate may act as a CA. Key Usage is enforced here as
+        // defence in depth. RFC 5280 §6.1.4(n) only requires the keyCertSign
+        // check when a Key Usage extension is present; we additionally require
+        // the extension itself on every certificate (leaf and CA) so that a CA
+        // can never sign a child without an explicit keyCertSign bit, and a leaf
+        // can never be used to verify the Quote without digitalSignature.
         if let Some(ku) = extract_key_usage(cert) {
             if is_leaf && !ku.digital_signature {
                 return Err(ChainValidationReason::LeafMissingDigitalSignature.into());
@@ -347,8 +384,9 @@ pub(crate) fn validate_tpm_cert_chain(
                 return Err(ChainValidationReason::CaMissingKeyCertSign { index: i }.into());
             }
         } else if is_leaf {
-            // Leaf certificate MUST have Key Usage for signing
             return Err(ChainValidationReason::LeafMissingKeyUsage.into());
+        } else {
+            return Err(ChainValidationReason::CaMissingKeyUsage { index: i }.into());
         }
 
         // 3. Subject/Issuer name chaining
@@ -697,6 +735,92 @@ mod tests {
         let ku = ku.unwrap();
         assert!(ku.digital_signature, "digitalSignature bit should be set");
         assert!(!ku.key_cert_sign, "keyCertSign should not be set for leaf");
+    }
+
+    #[test]
+    fn test_reject_ca_without_key_usage() {
+        use pki_types::UnixTime;
+        use std::time::Duration;
+
+        // Root CA with cA:TRUE but NO Key Usage extension (empty key_usages →
+        // rcgen omits the extension entirely). BasicConstraints alone would
+        // accept it as a CA; the new Key Usage requirement must reject it.
+        let mut ca_params =
+            rcgen::CertificateParams::new(vec!["No-KU Test Root".to_string()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![];
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        // Leaf signed by that CA, with a valid Key Usage of its own.
+        let mut leaf_params =
+            rcgen::CertificateParams::new(vec!["No-KU Test Leaf".to_string()]).unwrap();
+        leaf_params.is_ca = rcgen::IsCa::NoCa;
+        leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        let chain = vec![
+            Certificate::from_der(leaf_cert.der()).unwrap(),
+            Certificate::from_der(ca_cert.der()).unwrap(),
+        ];
+
+        let time = UnixTime::since_unix_epoch(Duration::from_secs(
+            crate::test_support::EPHEMERAL_TIMESTAMP_SECS,
+        ));
+        let result = validate_tpm_cert_chain(&chain, time);
+        assert!(
+            matches!(
+                result,
+                Err(VerifyError::ChainValidation(
+                    ChainValidationReason::CaMissingKeyUsage { index: 1 }
+                ))
+            ),
+            "CA without Key Usage must be rejected, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_reject_signature_algorithm_mismatch() {
+        use pki_types::UnixTime;
+        use std::time::Duration;
+
+        // Real P-256 leaf+root chain (leaf signed ecdsa-with-SHA256).
+        let keys = crate::test_support::generate_gcp_chain();
+
+        // Corrupt the leaf so its inner tbsCertificate.signature algorithm
+        // differs from the outer signatureAlgorithm. The ecdsa-with-SHA256 OID
+        // (1.2.840.10045.4.3.2) is DER-encoded as 06 08 2A 86 48 CE 3D 04 03 02;
+        // the first occurrence in the certificate is the inner tbs.signature.
+        // Flip its final byte to 0x03 (ecdsa-with-SHA384 OID) so inner != outer.
+        let pattern = [0x06u8, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02];
+        let mut leaf_der = keys.leaf_der.clone();
+        let pos = leaf_der
+            .windows(pattern.len())
+            .position(|w| w == pattern)
+            .expect("ecdsa-with-SHA256 OID present in leaf cert");
+        leaf_der[pos + pattern.len() - 1] = 0x03;
+
+        let chain = vec![
+            Certificate::from_der(&leaf_der).unwrap(),
+            Certificate::from_der(&keys.root_der).unwrap(),
+        ];
+
+        let time = UnixTime::since_unix_epoch(Duration::from_secs(
+            crate::test_support::EPHEMERAL_TIMESTAMP_SECS,
+        ));
+        let result = validate_tpm_cert_chain(&chain, time);
+        assert!(
+            matches!(
+                result,
+                Err(VerifyError::ChainValidation(
+                    ChainValidationReason::SignatureAlgorithmMismatch { index: 0 }
+                ))
+            ),
+            "mismatched inner/outer signature algorithm must be rejected, got: {:?}",
+            result
+        );
     }
 
     #[test]
