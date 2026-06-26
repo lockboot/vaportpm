@@ -7,7 +7,8 @@
 //! not hardcoded separately.
 
 use crate::cert::{extract_ski, pem_to_der};
-use std::sync::OnceLock;
+use alloc::vec;
+use alloc::vec::Vec;
 
 // ============================================================================
 // Embedded certificate PEMs
@@ -40,18 +41,14 @@ pub struct CertInfo {
     pub ski: Vec<u8>,
 }
 
-/// Lazily-initialized certificate info cache
-static CERT_INFOS: OnceLock<Vec<CertInfo>> = OnceLock::new();
-
-/// Get all embedded certificate infos, initializing on first call
-fn get_cert_infos() -> &'static [CertInfo] {
-    CERT_INFOS.get_or_init(|| {
-        // These are compile-time embedded certs - panic if they fail to parse
-        vec![
-            extract_cert_info(AWS_NITRO_ROOT_PEM, "AWS Nitro root"),
-            extract_cert_info(GCP_EKAK_ROOT_PEM, "GCP EK/AK root"),
-        ]
-    })
+/// Parse the embedded roots into (pem, ski) pairs. Recomputed on demand: no_std has
+/// no `OnceLock`, and the embedded set is tiny (touched only during a cert-chain walk).
+fn cert_infos() -> Vec<CertInfo> {
+    // These are compile-time embedded certs - panic if they fail to parse
+    vec![
+        extract_cert_info(AWS_NITRO_ROOT_PEM, "AWS Nitro root"),
+        extract_cert_info(GCP_EKAK_ROOT_PEM, "GCP EK/AK root"),
+    ]
 }
 
 /// Extract certificate info from PEM
@@ -73,7 +70,7 @@ fn extract_cert_info(pem: &'static str, name: &str) -> CertInfo {
 ///
 /// Returns the PEM-encoded certificate if found.
 pub fn find_issuer_by_aki(aki: &[u8]) -> Option<&'static str> {
-    for info in get_cert_infos() {
+    for info in cert_infos() {
         if info.ski == aki {
             return Some(info.pem);
         }
@@ -85,7 +82,7 @@ pub fn find_issuer_by_aki(aki: &[u8]) -> Option<&'static str> {
 ///
 /// Returns the Subject Key Identifier bytes.
 pub fn get_ski(pem: &str) -> Option<Vec<u8>> {
-    for info in get_cert_infos() {
+    for info in cert_infos() {
         if info.pem == pem {
             return Some(info.ski.clone());
         }

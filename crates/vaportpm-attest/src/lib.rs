@@ -25,16 +25,19 @@ use std::fs::{File, OpenOptions};
 #[cfg(feature = "std")]
 use std::io::{Read, Write};
 
-#[cfg(feature = "std")]
+// Attestation surface (quote + cert chain + JSON). no_std + alloc; gated by `attest`.
+#[cfg(feature = "attest")]
 pub mod a9n;
-#[cfg(feature = "std")]
+#[cfg(feature = "attest")]
 pub mod cert;
 pub mod ek;
-#[cfg(feature = "std")]
+// NSM (AWS Nitro) attestation is reached via a TPM vendor command, so it is
+// no_std-capable and part of the attest surface (not std).
+#[cfg(feature = "attest")]
 pub mod nsm;
 pub mod nv;
 pub mod pcr;
-#[cfg(feature = "std")]
+#[cfg(feature = "attest")]
 pub mod roots;
 
 // Re-export extension traits for convenience
@@ -42,13 +45,21 @@ pub use ek::KeyOps;
 pub use nv::NvOps;
 pub use pcr::PcrOps;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "attest")]
 pub use nsm::NsmOps;
 
-#[cfg(feature = "std")]
+// Attestation core: attest_with takes a &mut Tpm and a CertFetcher, so it works in
+// no_std/UEFI with a caller-supplied transport + fetcher.
+#[cfg(feature = "attest")]
+pub use a9n::attest_with;
+#[cfg(feature = "attest")]
+pub use cert::{der_to_pem, extract_aki, extract_ski, pem_to_der, CertFetcher};
+
+// Convenience std entrypoint: opens /dev/tpm0 and uses the built-in HTTP fetcher.
+#[cfg(feature = "http-fetch")]
 pub use a9n::attest;
-#[cfg(feature = "std")]
-pub use cert::{der_to_pem, extract_aki, extract_ski, pem_to_der};
+#[cfg(feature = "http-fetch")]
+pub use cert::StdHttpFetcher;
 
 /// TPM 2.0 command codes
 #[repr(u32)]
@@ -367,8 +378,8 @@ impl CommandBuffer {
         result
     }
 
-    /// Finalize command with a vendor-specific command code
-    #[cfg(feature = "std")]
+    /// Finalize command with a vendor-specific command code (e.g. AWS NSM request)
+    #[cfg(feature = "attest")]
     fn finalize_vendor(mut self, tag: TpmSt, vendor_code: u32) -> Vec<u8> {
         let total_size = 10 + self.data.len(); // header is 10 bytes
         let mut result = Vec::new();

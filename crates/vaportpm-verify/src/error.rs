@@ -12,6 +12,9 @@ pub enum VerifyError {
     #[error("Invalid hex encoding: {0}")]
     HexDecode(#[from] hex::FromHexError),
 
+    #[error("Attestation input decode failed: {0}")]
+    InputDecode(String),
+
     #[error("Invalid attestation structure: {0}")]
     InvalidAttest(#[from] InvalidAttestReason),
 

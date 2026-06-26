@@ -7,16 +7,26 @@
 //! - Certificate chain fetching via AIA (Authority Information Access) URLs
 //! - Extension extraction (SKI, AKI, AIA)
 
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use der::oid::ObjectIdentifier;
 use der::Decode;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::{AuthorityInfoAccessSyntax, AuthorityKeyIdentifier};
 use x509_cert::Certificate;
+
+/// Fetches a DER certificate from an `http://` URL. Injected into the certificate
+/// chain walker so a no_std/UEFI caller can supply its own transport (e.g. over
+/// EFI_TCP4) while std builds use [`StdHttpFetcher`]. AIA caIssuers URLs are plain
+/// HTTP by PKI convention, so no TLS is required.
+pub trait CertFetcher {
+    /// Fetch the DER bytes of the certificate at `url` (scheme `http://`).
+    fn fetch(&self, url: &str) -> Result<Vec<u8>>;
+}
 
 /// DER SEQUENCE tag with 2-byte length (0x30 0x82)
 /// Used to detect valid X.509 certificates in DER format
@@ -36,7 +46,7 @@ pub fn der_to_pem(der: &[u8], label: &str) -> String {
     let base64_encoded = STANDARD.encode(der);
     let mut pem = format!("-----BEGIN {}-----\n", label);
     for chunk in base64_encoded.as_bytes().chunks(64) {
-        pem.push_str(std::str::from_utf8(chunk).unwrap());
+        pem.push_str(core::str::from_utf8(chunk).unwrap());
         pem.push('\n');
     }
     pem.push_str(&format!("-----END {}-----\n", label));
@@ -145,7 +155,7 @@ pub fn extract_aia_url(cert_der: &[u8]) -> Option<String> {
 /// First attempts to find issuer certificates from embedded trust anchors
 /// using AKI/SKI matching. Falls back to AIA URL fetching if no embedded
 /// cert matches.
-pub fn fetch_cert_chain(leaf_cert: &[u8]) -> Result<Vec<Vec<u8>>> {
+pub fn fetch_cert_chain(leaf_cert: &[u8], fetcher: &dyn CertFetcher) -> Result<Vec<Vec<u8>>> {
     use crate::roots;
 
     let mut chain = vec![leaf_cert.to_vec()];
@@ -177,8 +187,8 @@ pub fn fetch_cert_chain(leaf_cert: &[u8]) -> Result<Vec<Vec<u8>>> {
             }
         };
 
-        // Fetch issuer certificate via HTTP
-        let issuer_cert = fetch_certificate(&aia_url)?;
+        // Fetch issuer certificate via the injected fetcher (HTTP)
+        let issuer_cert = fetcher.fetch(&aia_url)?;
 
         if !issuer_cert.starts_with(&DER_SEQUENCE_LONG) {
             return Err(anyhow!(
@@ -194,8 +204,24 @@ pub fn fetch_cert_chain(leaf_cert: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(chain)
 }
 
+/// A [`CertFetcher`] backed by `std::net::TcpStream` (plain HTTP). The default
+/// fetcher for std builds; pass it to [`fetch_cert_chain`] / `attest_with`.
+#[cfg(feature = "http-fetch")]
+pub struct StdHttpFetcher;
+
+#[cfg(feature = "http-fetch")]
+impl CertFetcher for StdHttpFetcher {
+    fn fetch(&self, url: &str) -> Result<Vec<u8>> {
+        std_http_get(url)
+    }
+}
+
 /// Fetch a certificate from an HTTP URL (no TLS support - AIA URLs are HTTP)
-pub fn fetch_certificate(url: &str) -> Result<Vec<u8>> {
+#[cfg(feature = "http-fetch")]
+fn std_http_get(url: &str) -> Result<Vec<u8>> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
     // Parse URL - only support http://
     if !url.starts_with("http://") {
         return Err(anyhow!("Only HTTP URLs are supported: {}", url));

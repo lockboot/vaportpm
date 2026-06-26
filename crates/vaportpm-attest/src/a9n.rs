@@ -7,11 +7,15 @@
 //! - Reading PCR values
 //! - Generating attestation documents
 
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
 
-use crate::cert::{der_to_pem, fetch_cert_chain, DER_SEQUENCE_LONG};
+use crate::cert::{der_to_pem, fetch_cert_chain, CertFetcher, DER_SEQUENCE_LONG};
 use crate::{KeyOps, NsmOps, NvOps, PcrOps, PublicKey, Tpm, TPM_RH_ENDORSEMENT};
 
 /// GCP AK certificate NV index (ECC)
@@ -22,7 +26,7 @@ const GCP_AK_TEMPLATE_NV_INDEX_ECC: u32 = 0x01c10003;
 /// Result type for attestation helper functions
 /// Contains: (ak_pubkeys, attestation_data, gcp_attestation, ak_handle)
 type AttestResult = (
-    HashMap<String, EccPublicKeyCoords>,
+    BTreeMap<String, EccPublicKeyCoords>,
     AttestationData,
     Option<GcpAttestationData>,
     Option<u32>,
@@ -33,9 +37,9 @@ type AttestResult = (
 pub struct AttestationOutput {
     /// Nonce/challenge used for this attestation (hex-encoded)
     pub nonce: String,
-    pub pcrs: HashMap<String, BTreeMap<u8, String>>,
+    pub pcrs: BTreeMap<String, BTreeMap<u8, String>>,
     /// Attestation Key public keys (hex-encoded ECC coordinates)
-    pub ak_pubkeys: HashMap<String, EccPublicKeyCoords>,
+    pub ak_pubkeys: BTreeMap<String, EccPublicKeyCoords>,
     pub attestation: AttestationContainer,
 }
 
@@ -49,7 +53,7 @@ pub struct EccPublicKeyCoords {
 /// Container for both TPM and optional platform-specific attestations
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttestationContainer {
-    pub tpm: HashMap<String, AttestationData>,
+    pub tpm: BTreeMap<String, AttestationData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nitro: Option<NitroAttestationData>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -119,13 +123,14 @@ fn is_gcp_tpm(tpm: &mut Tpm) -> bool {
 ///
 /// # Errors
 /// Returns an error if the platform is not recognized (only AWS Nitro and GCP are supported)
-pub fn attest(nonce: &[u8]) -> Result<String> {
-    let mut tpm = Tpm::open_direct()?;
-
+/// Produce the unified attestation JSON for an already-open TPM, using `fetcher` to
+/// retrieve any AIA intermediate certificates. no_std + alloc: a UEFI caller passes a
+/// `Tpm` over EFI_TCG2 and a `CertFetcher` over EFI_TCP4.
+pub fn attest_with(tpm: &mut Tpm, nonce: &[u8], fetcher: &dyn CertFetcher) -> Result<String> {
     // Step 1: Detect platform
     // GCP detection is cheap - just checks for NV index existence
     let is_nitro = tpm.is_nitro_tpm()?;
-    let is_gcp = !is_nitro && is_gcp_tpm(&mut tpm);
+    let is_gcp = !is_nitro && is_gcp_tpm(tpm);
 
     // Step 2: Read all allocated PCRs from all banks
     let all_pcrs = tpm.read_all_allocated_pcrs()?;
@@ -150,7 +155,7 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
     }
 
     // Build PCRs output
-    let mut pcrs_by_alg: HashMap<String, BTreeMap<u8, String>> = HashMap::new();
+    let mut pcrs_by_alg: BTreeMap<String, BTreeMap<u8, String>> = BTreeMap::new();
     let pcr_map = pcrs_by_alg.entry(pcr_alg.name().to_string()).or_default();
     for (idx, value) in &pcr_values {
         pcr_map.insert(*idx, hex::encode(value));
@@ -159,26 +164,28 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
     // Step 5: Create or retrieve AK and sign PCRs with TPM2_Quote
     let (signing_key_public_keys, attestation_data, gcp_attestation, ak_handle) = if is_gcp {
         // GCP path: recreate AK from Google's template
-        attest_gcp(&mut tpm, nonce, &pcr_values, pcr_alg)?
+        attest_gcp(tpm, nonce, &pcr_values, pcr_alg, fetcher)?
     } else if is_nitro {
         // Nitro path: create long-term AK, use TPM2_Quote
         // SHA-384 is hardcoded — the Quote must attest the same PCR bank that
         // the Nitro NSM document signs, so they can be cross-verified.
-        attest_nitro(&mut tpm, nonce, &pcr_values)?
+        attest_nitro(tpm, nonce, &pcr_values)?
     } else {
         return Err(anyhow!(
             "Unknown platform - only AWS Nitro and GCP Shielded VM are supported"
         ));
     };
 
-    let mut tpm_attestations = HashMap::new();
+    let mut tpm_attestations = BTreeMap::new();
     tpm_attestations.insert("ecc_p256".to_string(), attestation_data);
 
-    // Step 6: Get Nitro attestation if on AWS
+    // Step 6: Get the Nitro NSM document if on AWS (binds the AK pubkey to the Nitro
+    // root). This rides the TPM vendor command (0x20000001), so it works no_std/UEFI.
     let nitro_attestation = if is_nitro {
         if let Some(pk) = signing_key_public_keys.get("ecc_p256") {
             let public_key_hex = format!("04{}{}", pk.x, pk.y);
-            let public_key_bytes = hex::decode(&public_key_hex)?;
+            let public_key_bytes = hex::decode(&public_key_hex)
+                .map_err(|e| anyhow!("invalid AK public key hex: {e}"))?;
 
             match tpm.nsm_attest(
                 None,                   // user_data
@@ -221,6 +228,13 @@ pub fn attest(nonce: &[u8]) -> Result<String> {
     Ok(json)
 }
 
+/// Convenience std entrypoint: open /dev/tpm0 and use the built-in HTTP fetcher.
+#[cfg(feature = "http-fetch")]
+pub fn attest(nonce: &[u8]) -> Result<String> {
+    let mut tpm = Tpm::open_direct()?;
+    attest_with(&mut tpm, nonce, &crate::cert::StdHttpFetcher)
+}
+
 /// Nitro attestation path: create restricted AK and use TPM2_Quote
 ///
 /// Creates a TCG-compliant restricted AK in the endorsement hierarchy, then uses
@@ -234,7 +248,7 @@ fn attest_nitro(tpm: &mut Tpm, nonce: &[u8], pcr_values: &[(u8, Vec<u8>)]) -> Re
     // Trust comes from Nitro NSM document binding the AK public key
     let signing_key = tpm.create_restricted_ak(TPM_RH_ENDORSEMENT)?;
 
-    let mut signing_key_public_keys = HashMap::new();
+    let mut signing_key_public_keys = BTreeMap::new();
     signing_key_public_keys.insert(
         "ecc_p256".to_string(),
         EccPublicKeyCoords {
@@ -271,6 +285,7 @@ fn attest_gcp(
     nonce: &[u8],
     pcr_values: &[(u8, Vec<u8>)],
     pcr_alg: crate::TpmAlg,
+    fetcher: &dyn CertFetcher,
 ) -> Result<AttestResult> {
     // Read ECC AK template from NV RAM (prefer ECC over RSA for ECDSA signing)
     let ak_template = tpm.nv_read(GCP_AK_TEMPLATE_NV_INDEX_ECC)?;
@@ -281,7 +296,7 @@ fn attest_gcp(
     // Extract ECC public key coordinates
     let signing_key_public_keys = match &ak_result.public_key {
         PublicKey::Ecc(ecc) => {
-            let mut pks = HashMap::new();
+            let mut pks = BTreeMap::new();
             pks.insert(
                 "ecc_p256".to_string(),
                 EccPublicKeyCoords {
@@ -307,7 +322,7 @@ fn attest_gcp(
     let quote_result = tpm.quote(ak_result.handle, nonce, &pcr_selection)?;
 
     // Read AK certificate chain from NV RAM
-    let ak_cert_chain = read_gcp_ak_cert_chain(tpm)?;
+    let ak_cert_chain = read_gcp_ak_cert_chain(tpm, fetcher)?;
 
     let attestation_data = AttestationData {
         attest_data: hex::encode(&quote_result.attest_data),
@@ -339,7 +354,7 @@ fn build_pcr_bitmap(pcr_values: &[(u8, Vec<u8>)]) -> Vec<u8> {
 }
 
 /// Read GCP ECC AK certificate chain from NV RAM and fetch issuer certs
-fn read_gcp_ak_cert_chain(tpm: &mut Tpm) -> Result<String> {
+fn read_gcp_ak_cert_chain(tpm: &mut Tpm, fetcher: &dyn CertFetcher) -> Result<String> {
     // Read ECC AK certificate (matches the ECC AK template we use)
     let ak_cert = tpm.nv_read(GCP_AK_CERT_NV_INDEX_ECC)?;
 
@@ -351,7 +366,7 @@ fn read_gcp_ak_cert_chain(tpm: &mut Tpm) -> Result<String> {
     }
 
     // Build full chain by fetching issuer certs via AIA
-    let chain = fetch_cert_chain(&ak_cert)?;
+    let chain = fetch_cert_chain(&ak_cert, fetcher)?;
 
     // Convert all certs to PEM and concatenate
     let pem_chain: String = chain
