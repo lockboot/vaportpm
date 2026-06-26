@@ -16,6 +16,7 @@ pub mod pcr;
 mod tpm;
 mod x509;
 
+use base64::Engine as _;
 use serde::Serialize;
 use x509::parse_cert_chain_pem;
 
@@ -320,9 +321,66 @@ pub fn verify_attestation_output(
 /// For testing with fixtures that have expired certificates, use
 /// `verify_attestation_output` directly with a specific time.
 pub fn verify_attestation_json(json: &str) -> Result<VerificationResult, VerifyError> {
+    let json = normalize_attestation_input(json)?;
     let output: AttestationOutput =
-        serde_json::from_str(json).map_err(InvalidAttestReason::JsonParse)?;
+        serde_json::from_str(&json).map_err(InvalidAttestReason::JsonParse)?;
     verify_attestation_output(&output, UnixTime::now())
+}
+
+/// Normalize a captured attestation into JSON, auto-detecting the format. Accepts bare
+/// JSON, a base64 blob, or either wrapped in `===ATTESTATION-BEGIN/END===` markers with
+/// EC2/Nitro serial-console timestamps (`[YYYY-MM-DDThh:mm:ss...]`) interleaved -- the
+/// payload emits base64 so no serial write is large enough for the console to inject a
+/// timestamp mid-line, but any that land between lines are stripped here regardless.
+pub fn normalize_attestation_input(input: &str) -> Result<String, VerifyError> {
+    const BEGIN: &str = "===ATTESTATION-BEGIN===";
+    const END: &str = "===ATTESTATION-END===";
+    let body = match (input.find(BEGIN), input.find(END)) {
+        (Some(b), Some(e)) if e > b + BEGIN.len() => &input[b + BEGIN.len()..e],
+        _ => input,
+    };
+    let body = strip_console_timestamps(body);
+    let compact: String = body.split_whitespace().collect();
+    let looks_base64 = !compact.is_empty()
+        && !compact.starts_with('{')
+        && compact
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'='));
+    if looks_base64 {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(compact.as_bytes())
+            .map_err(|e| VerifyError::InputDecode(format!("base64: {e}")))?;
+        return String::from_utf8(bytes)
+            .map_err(|e| VerifyError::InputDecode(format!("utf-8: {e}")));
+    }
+    Ok(body)
+}
+
+/// Remove `[YYYY-MM-DDThh:mm:ss...]` serial-console timestamps from `s`, copying every
+/// other byte through. The attestation payload (base64/JSON/hex) never contains `[`.
+fn strip_console_timestamps(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let (mut i, mut last) = (0usize, 0usize);
+    while i + 5 < b.len() {
+        if b[i] == b'['
+            && b[i + 1].is_ascii_digit()
+            && b[i + 2].is_ascii_digit()
+            && b[i + 3].is_ascii_digit()
+            && b[i + 4].is_ascii_digit()
+            && b[i + 5] == b'-'
+        {
+            if let Some(rel) = s[i..].find(']') {
+                out.push_str(&s[last..i]);
+                i += rel + 1;
+                last = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&s[last..]);
+    out
 }
 
 /// Guards the trust anchor: the precomputed root public-key hash constants must
@@ -386,10 +444,10 @@ mod tests {
     fn test_reject_empty_attestation() {
         let output = AttestationOutput {
             nonce: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            pcrs: std::collections::HashMap::new(),
-            ak_pubkeys: std::collections::HashMap::new(),
+            pcrs: std::collections::BTreeMap::new(),
+            ak_pubkeys: std::collections::BTreeMap::new(),
             attestation: AttestationContainer {
-                tpm: std::collections::HashMap::new(),
+                tpm: std::collections::BTreeMap::new(),
                 nitro: None,
                 gcp: None,
             },

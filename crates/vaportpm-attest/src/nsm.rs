@@ -5,6 +5,8 @@
 //! Single-approach implementation based on TPM 2.0 spec and AWS trace analysis.
 //! No "try everything" - either works correctly or fails with clear diagnostics.
 
+use alloc::vec::Vec;
+
 use crate::nv::{NvOps, NV_INDEX_USER_END, NV_INDEX_USER_START, TPM2_PT_NV_BUFFER_MAX};
 use crate::nv::{TPMA_NV_AUTHREAD, TPMA_NV_AUTHWRITE};
 use crate::{CommandBuffer, Tpm, TpmSt, TPM_ALG_SHA256};

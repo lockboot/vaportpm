@@ -6,29 +6,34 @@ resolver = "2"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_bytes = "0.11"
+# Deps reused by vaportpm-attest's no_std/UEFI build carry default-features = false
+# HERE, at the workspace level -- a member cannot override default-features when
+# inheriting (Cargo ignores it), so it must be set once at the source. `alloc` (the
+# no_std base each needs) is included; each crate layers `std` on via its own features
+# (attest's `std`, verify directly), keeping versions consistent across both crates.
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+serde_bytes = { version = "0.11", default-features = false, features = ["alloc"] }
 serde-big-array = "0.5"
 zerocopy = { version = "0.8", features = ["derive"] }
-base64 = "0.22"
-sha1 = "0.10"
-sha2 = "0.10"
-hmac = "0.12"
-anyhow = "1.0"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+sha1 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+anyhow = { version = "1.0", default-features = false }
 thiserror = "1.0"
-hex = "0.4"
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
 # X.509 and crypto for verification
-der = { version = "0.7", features = ["alloc", "pem", "oid"] }
+der = { version = "0.7", default-features = false, features = ["alloc", "pem", "oid"] }
 spki = { version = "0.7", features = ["alloc"] }
-x509-cert = { version = "0.2", features = ["pem"] }
+x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 p384 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 ecdsa = { version = "0.16", features = ["verifying", "der"] }
 rsa = { version = "0.9", features = ["sha2"] }
 coset = "0.3"
-ciborium = "0.2"
+ciborium = { version = "0.2", default-features = false }
 
 # Time types for certificate validation
 pki-types = { package = "rustls-pki-types", version = "=1.13.0", default-features = false, features = ["std"] }
