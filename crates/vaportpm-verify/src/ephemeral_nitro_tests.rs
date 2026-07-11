@@ -8,7 +8,8 @@
 
 use std::collections::BTreeMap;
 
-use p256::pkcs8::DecodePrivateKey as _;
+use p256::pkcs8::EncodePrivateKey as _;
+use rand_core::OsRng;
 
 use crate::error::{
     CborParseReason, ChainValidationReason, CoseVerifyReason, InvalidAttestReason,
@@ -24,9 +25,8 @@ use crate::{
 
 /// Helper: generate an ephemeral P-256 AK key pair, returning (P256PublicKey, pkcs8_der).
 fn ephemeral_ak() -> (P256PublicKey, Vec<u8>) {
-    let ak_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let ak_pkcs8 = ak_key.serialize_der();
-    let ak_sk = p256::ecdsa::SigningKey::from_pkcs8_der(&ak_pkcs8).unwrap();
+    let ak_sk = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let ak_pkcs8 = ak_sk.to_pkcs8_der().unwrap().as_bytes().to_vec();
     let ak_point = ak_sk.verifying_key().to_encoded_point(false);
     let ak_pubkey = P256PublicKey::from_sec1_uncompressed(ak_point.as_bytes()).unwrap();
     (ak_pubkey, ak_pkcs8)

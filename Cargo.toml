@@ -27,6 +27,8 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 # X.509 and crypto for verification
 der = { version = "0.7", default-features = false, features = ["alloc", "pem", "oid"] }
 spki = { version = "0.7", features = ["alloc"] }
+# Keep no_std-base at the workspace level (attest's UEFI build). `builder`/`hazmat` are needed
+# only by vaportpm-verify's tests, so they are opted in there (a std crate), not here.
 x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 p384 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }

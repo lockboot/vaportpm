@@ -742,27 +742,22 @@ mod tests {
         use pki_types::UnixTime;
         use std::time::Duration;
 
-        // Root CA with cA:TRUE but NO Key Usage extension (empty key_usages →
-        // rcgen omits the extension entirely). BasicConstraints alone would
+        // Root CA with cA:TRUE but NO Key Usage extension. BasicConstraints alone would
         // accept it as a CA; the new Key Usage requirement must reject it.
-        let mut ca_params =
-            rcgen::CertificateParams::new(vec!["No-KU Test Root".to_string()]).unwrap();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params.key_usages = vec![];
-        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
+        let ca_key = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+        let leaf_key = p256::ecdsa::SigningKey::random(&mut rand_core::OsRng);
+        let ca_der = crate::test_support::mk_p256_ca_no_keyusage("No-KU Test Root", &ca_key);
         // Leaf signed by that CA, with a valid Key Usage of its own.
-        let mut leaf_params =
-            rcgen::CertificateParams::new(vec!["No-KU Test Leaf".to_string()]).unwrap();
-        leaf_params.is_ca = rcgen::IsCa::NoCa;
-        leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+        let leaf_der = crate::test_support::mk_p256_leaf(
+            "No-KU Test Leaf",
+            &leaf_key,
+            "No-KU Test Root",
+            &ca_key,
+        );
 
         let chain = vec![
-            Certificate::from_der(leaf_cert.der()).unwrap(),
-            Certificate::from_der(ca_cert.der()).unwrap(),
+            Certificate::from_der(&leaf_der).unwrap(),
+            Certificate::from_der(&ca_der).unwrap(),
         ];
 
         let time = UnixTime::since_unix_epoch(Duration::from_secs(

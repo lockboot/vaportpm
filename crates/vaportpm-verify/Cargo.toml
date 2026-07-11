@@ -12,7 +12,7 @@ vaportpm-attest = { path = "../vaportpm-attest" }
 # UEFI build); vaportpm-verify is a std crate, so it opts each back into `std`.
 der = { workspace = true, features = ["std"] }
 spki = { workspace = true }
-x509-cert = { workspace = true, features = ["std"] }
+x509-cert = { workspace = true, features = ["std", "builder", "hazmat"] }
 
 # Time types
 pki-types = { workspace = true }
@@ -37,9 +37,11 @@ serde_json = { workspace = true, features = ["std"] }
 zerocopy = { workspace = true }
 
 [dev-dependencies]
-rcgen = "0.13"
+# Test certificates are built with x509-cert's `builder` (a workspace dep) + p256/p384 signers, so
+# no `ring`/`rcgen` in the tree. rand_core (getrandom) supplies OsRng for ephemeral test keys.
 p256 = { workspace = true, features = ["pkcs8"] }
 p384 = { workspace = true, features = ["pkcs8"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [lib]
 name = "vaportpm_verify"

@@ -21,6 +21,20 @@ use crate::x509::hash_public_key;
 use crate::{CloudProvider, DecodedAttestationOutput, DecodedPlatformAttestation};
 use pki_types::UnixTime;
 
+// Pure-Rust test certificate factory (x509-cert `builder` + p256/p384 signers) -- replaces rcgen,
+// so no `ring`/C toolchain enters the tree. See `define_certgen!` below.
+use std::str::FromStr;
+
+use der::asn1::{GeneralizedTime, UtcTime};
+use der::Encode as _;
+use p256::pkcs8::EncodePrivateKey as _;
+use rand_core::OsRng;
+use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+use x509_cert::name::Name;
+use x509_cert::serial_number::SerialNumber;
+use x509_cert::spki::SubjectPublicKeyInfoOwned;
+use x509_cert::time::{Time, Validity};
+
 // ============================================================================
 // TPM Quote builder
 // ============================================================================
@@ -233,6 +247,107 @@ pub fn build_nitro_cose_doc(
 // Certificate chain generation
 // ============================================================================
 
+/// Validity window wide enough to cover both the fixed test verification time
+/// (`EPHEMERAL_TIMESTAMP_SECS`, Feb 2026) and the real build clock. rcgen defaulted to a similarly
+/// wide window (1975..4096), which these tests relied on; `Validity::from_now` would set
+/// `not_before = now` and reject the fixed-timestamp verification.
+fn wide_validity() -> Validity {
+    Validity {
+        not_before: Time::UtcTime(
+            UtcTime::from_unix_duration(Duration::from_secs(946_684_800)).unwrap(), // 2000-01-01
+        ),
+        not_after: Time::GeneralTime(
+            GeneralizedTime::from_unix_duration(Duration::from_secs(4_102_444_800)).unwrap(), // 2100-01-01
+        ),
+    }
+}
+
+/// Generate a self-signed CA and a CA-signed leaf builder for one ECDSA curve. The CA gets
+/// `Profile::Root` (BasicConstraints CA + KeyUsage keyCertSign) and the leaf `Profile::Leaf`
+/// (CA:FALSE + KeyUsage digitalSignature) -- exactly what `validate_tpm_cert_chain` requires.
+macro_rules! define_certgen {
+    ($curve:ident, $ca_fn:ident, $leaf_fn:ident) => {
+        /// Self-signed CA cert (DER) with subject/issuer `CN=cn`, signed by `ca`.
+        pub(crate) fn $ca_fn(cn: &str, ca: &$curve::ecdsa::SigningKey) -> Vec<u8> {
+            let subject = Name::from_str(&format!("CN={cn}")).unwrap();
+            let spki = SubjectPublicKeyInfoOwned::from_key(*ca.verifying_key()).unwrap();
+            CertificateBuilder::new(
+                Profile::Root,
+                SerialNumber::from(1u32),
+                wide_validity(),
+                subject,
+                spki,
+                ca,
+            )
+            .unwrap()
+            .build::<$curve::ecdsa::DerSignature>()
+            .unwrap()
+            .to_der()
+            .unwrap()
+        }
+
+        /// Leaf cert (DER) `CN=cn`, subject key `leaf`, signed by `ca` (issuer `CN=issuer_cn`).
+        pub(crate) fn $leaf_fn(
+            cn: &str,
+            leaf: &$curve::ecdsa::SigningKey,
+            issuer_cn: &str,
+            ca: &$curve::ecdsa::SigningKey,
+        ) -> Vec<u8> {
+            let subject = Name::from_str(&format!("CN={cn}")).unwrap();
+            let issuer = Name::from_str(&format!("CN={issuer_cn}")).unwrap();
+            let spki = SubjectPublicKeyInfoOwned::from_key(*leaf.verifying_key()).unwrap();
+            CertificateBuilder::new(
+                Profile::Leaf {
+                    issuer,
+                    enable_key_agreement: false,
+                    enable_key_encipherment: false,
+                    include_subject_key_identifier: true,
+                },
+                SerialNumber::from(2u32),
+                wide_validity(),
+                subject,
+                spki,
+                ca,
+            )
+            .unwrap()
+            .build::<$curve::ecdsa::DerSignature>()
+            .unwrap()
+            .to_der()
+            .unwrap()
+        }
+    };
+}
+define_certgen!(p256, mk_p256_ca, mk_p256_leaf);
+define_certgen!(p384, mk_p384_ca, mk_p384_leaf);
+
+/// A self-signed P-256 CA with BasicConstraints CA:TRUE but NO KeyUsage extension. Used to verify
+/// the chain validator rejects a CA lacking Key Usage. `Profile::Manual` opts out of the builder's
+/// default extensions, so we add only BasicConstraints.
+pub(crate) fn mk_p256_ca_no_keyusage(cn: &str, ca: &p256::ecdsa::SigningKey) -> Vec<u8> {
+    let subject = Name::from_str(&format!("CN={cn}")).unwrap();
+    let spki = SubjectPublicKeyInfoOwned::from_key(*ca.verifying_key()).unwrap();
+    let mut builder = CertificateBuilder::new(
+        Profile::Manual { issuer: None },
+        SerialNumber::from(1u32),
+        wide_validity(),
+        subject,
+        spki,
+        ca,
+    )
+    .unwrap();
+    builder
+        .add_extension(&x509_cert::ext::pkix::BasicConstraints {
+            ca: true,
+            path_len_constraint: None,
+        })
+        .unwrap();
+    builder
+        .build::<p256::ecdsa::DerSignature>()
+        .unwrap()
+        .to_der()
+        .unwrap()
+}
+
 /// Generated key material for a P-384 Nitro-style cert chain.
 pub struct NitroChainKeys {
     /// Root CA cert DER
@@ -249,41 +364,21 @@ pub struct NitroChainKeys {
 ///
 /// Returns key material needed to build COSE documents and register the test root.
 pub fn generate_nitro_chain() -> NitroChainKeys {
-    // Root CA (self-signed, P-384)
-    let mut ca_params =
-        rcgen::CertificateParams::new(vec!["AWS Nitro Test Root".to_string()]).unwrap();
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![
-        rcgen::KeyUsagePurpose::KeyCertSign,
-        rcgen::KeyUsagePurpose::DigitalSignature,
-    ];
-    ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "AWS Nitro Test Root");
-    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-    // Leaf cert (signed by root, P-384)
-    let mut leaf_params =
-        rcgen::CertificateParams::new(vec!["Nitro Test Leaf".to_string()]).unwrap();
-    leaf_params.is_ca = rcgen::IsCa::NoCa;
-    leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-    leaf_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "Nitro Test Leaf");
-    let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+    // Root CA (self-signed, P-384) + leaf signed by it.
+    let ca_key = p384::ecdsa::SigningKey::random(&mut OsRng);
+    let leaf_key = p384::ecdsa::SigningKey::random(&mut OsRng);
+    let root_der = mk_p384_ca("AWS Nitro Test Root", &ca_key);
+    let leaf_der = mk_p384_leaf("Nitro Test Leaf", &leaf_key, "AWS Nitro Test Root", &ca_key);
 
     // Compute root pubkey hash
-    let root_x509 =
-        x509_cert::Certificate::from_der(ca_cert.der()).expect("root cert should parse");
+    let root_x509 = x509_cert::Certificate::from_der(&root_der).expect("root cert should parse");
     let root_pubkey = crate::x509::extract_public_key(&root_x509).unwrap();
     let root_pubkey_hash = hash_public_key(&root_pubkey);
 
     NitroChainKeys {
-        root_der: ca_cert.der().to_vec(),
-        leaf_der: leaf_cert.der().to_vec(),
-        cose_signing_key: leaf_key.serialize_der(),
+        root_der,
+        leaf_der,
+        cose_signing_key: leaf_key.to_pkcs8_der().unwrap().as_bytes().to_vec(),
         root_pubkey_hash,
     }
 }
@@ -304,47 +399,31 @@ pub struct GcpChainKeys {
 
 /// Generate a P-256 cert chain for GCP tests (leaf + root).
 pub fn generate_gcp_chain() -> GcpChainKeys {
-    // Root CA (self-signed, P-256)
-    let mut ca_params =
-        rcgen::CertificateParams::new(vec!["GCP EK/AK Test Root".to_string()]).unwrap();
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![
-        rcgen::KeyUsagePurpose::KeyCertSign,
-        rcgen::KeyUsagePurpose::DigitalSignature,
-    ];
-    ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "GCP EK/AK Test Root");
-    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-    // Leaf cert (signed by root, P-256)
-    let mut leaf_params =
-        rcgen::CertificateParams::new(vec!["GCP AK Test Leaf".to_string()]).unwrap();
-    leaf_params.is_ca = rcgen::IsCa::NoCa;
-    leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-    leaf_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "GCP AK Test Leaf");
-    let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+    // Root CA (self-signed, P-256) + leaf signed by it.
+    let ca_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let leaf_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let root_der = mk_p256_ca("GCP EK/AK Test Root", &ca_key);
+    let leaf_der = mk_p256_leaf(
+        "GCP AK Test Leaf",
+        &leaf_key,
+        "GCP EK/AK Test Root",
+        &ca_key,
+    );
 
     // Extract AK pubkey from leaf cert
-    let leaf_x509 =
-        x509_cert::Certificate::from_der(leaf_cert.der()).expect("leaf cert should parse");
+    let leaf_x509 = x509_cert::Certificate::from_der(&leaf_der).expect("leaf cert should parse");
     let ak_pubkey_vec = crate::x509::extract_public_key(&leaf_x509).unwrap();
     let ak_pubkey = P256PublicKey::from_sec1_uncompressed(&ak_pubkey_vec).unwrap();
 
     // Compute root pubkey hash
-    let root_x509 =
-        x509_cert::Certificate::from_der(ca_cert.der()).expect("root cert should parse");
+    let root_x509 = x509_cert::Certificate::from_der(&root_der).expect("root cert should parse");
     let root_pubkey = crate::x509::extract_public_key(&root_x509).unwrap();
     let root_pubkey_hash = hash_public_key(&root_pubkey);
 
     GcpChainKeys {
-        root_der: ca_cert.der().to_vec(),
-        leaf_der: leaf_cert.der().to_vec(),
-        ak_signing_key: leaf_key.serialize_der(),
+        root_der,
+        leaf_der,
+        ak_signing_key: leaf_key.to_pkcs8_der().unwrap().as_bytes().to_vec(),
         ak_pubkey,
         root_pubkey_hash,
     }
@@ -386,11 +465,10 @@ pub fn build_valid_nitro(
     let guard = register_test_root(chain.root_pubkey_hash, CloudProvider::Aws);
 
     // Generate AK key pair (P-256 for TPM Quote signing)
-    let ak_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let ak_signing_key_pkcs8 = ak_key.serialize_der();
+    let ak_signing_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let ak_signing_key_pkcs8 = ak_signing_key.to_pkcs8_der().unwrap().as_bytes().to_vec();
 
     // Extract AK public key (SEC1 uncompressed)
-    let ak_signing_key = p256::ecdsa::SigningKey::from_pkcs8_der(&ak_signing_key_pkcs8).unwrap();
     let ak_verifying_key = ak_signing_key.verifying_key();
     let ak_point = ak_verifying_key.to_encoded_point(false);
     let ak_pubkey = P256PublicKey::from_sec1_uncompressed(ak_point.as_bytes()).unwrap();
