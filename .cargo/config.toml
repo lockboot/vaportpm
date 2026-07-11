@@ -1,0 +1,42 @@
+# Per-repo Cargo config for vaportpm. vaportpm is a GNU-HOST repo: its default builds/tests and the
+# attest/verify CLIs are host (x86_64-unknown-linux-gnu) executables. Host linking therefore uses the
+# image's default `cc` (gcc, present in lockboot:build) -- we set NO host linker override, because
+# rust-lld cannot link glibc executables (rustc does not hand it the system library search paths, only
+# the self-contained crt for musl). Build scripts run at build time and don't affect artifact bytes,
+# so linking them with gcc is fine for reproducibility. Only the musl release ARTIFACTS use rust-lld +
+# bundled musl (fully static, reproducible, cc-free) -- see the sections below. This is the "gnu-host
+# repos link C and need cc" case that stage0/stage1's config comments call out.
+#
+# Kept in the repo (not only the shared workspace config) because CI checks out each repo ALONE, and
+# Cargo CONCATENATES rustflags across config files -- the shared /src/.cargo/config.toml sets no
+# rustflags, so nothing doubles. No `[build] target = musl`: that would force musl onto the host tools
+# and the test suite. Musl is opt-in via `--target` for `make release-x86` / `release-aarch64` below.
+
+[target.x86_64-unknown-linux-musl]
+# Fully static musl release artifacts. rust-lld + bundled musl, no system cc.
+rustflags = [
+    "-C", "linker=rust-lld",
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-static",
+    # Remap embedded dep source paths to a fixed prefix so builds don't depend on CARGO_HOME
+    # (CI uses /tmp/.cargo, local uses /src/.cargo); keeps CI and local byte-identical.
+    "--remap-path-prefix=/src/.cargo=/cargo",
+    "--remap-path-prefix=/tmp/.cargo=/cargo",
+    # Remap the rust-src sysroot to the baked /rustc/<hash> so std panic-location paths match CI.
+    # UPDATE THE HASH on a toolchain bump (rustc -Vv commit-hash); a stale value silently no-ops.
+    "--remap-path-prefix=/src/.rustup/toolchains/1.91.1-x86_64-unknown-linux-gnu/lib/rustlib/src/rust=/rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb",
+]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = [
+    "-C", "linker=rust-lld",
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-static",
+    "--remap-path-prefix=/src/.cargo=/cargo",
+    "--remap-path-prefix=/tmp/.cargo=/cargo",
+    "--remap-path-prefix=/src/.rustup/toolchains/1.91.1-x86_64-unknown-linux-gnu/lib/rustlib/src/rust=/rustc/ed61e7d7e242494fb7057f2657300d9e77bb4fcb",
+]
+
+[env]
+# Reproducible builds when this repo is built standalone (no workspace parent in CI).
+SOURCE_DATE_EPOCH = "0"
