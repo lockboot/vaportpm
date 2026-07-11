@@ -400,16 +400,9 @@ impl PcrOps for Tpm {
         }
         let pcr_digest = pcr_hasher.finalize();
 
-        // Step 2: Build PCR selection structure
-        let mut pcr_select = [0u8; 3]; // 3 bytes for PCRs 0-23
-        for (index, _value) in pcr_values {
-            if *index < 24 {
-                pcr_select[*index as usize / 8] |= 1 << (*index % 8);
-            }
-        }
-
-        // Step 3: Calculate policy digest
+        // Step 2: Calculate policy digest
         // policyDigest = SHA256(previousDigest || TPM_CC_PolicyPCR || pcrSelection || pcrDigest)
+        let indices: Vec<u8> = pcr_values.iter().map(|(index, _value)| *index).collect();
         let mut policy_hasher = Sha256::new();
 
         // previousDigest starts as all zeros (32 bytes for SHA256)
@@ -418,13 +411,8 @@ impl PcrOps for Tpm {
         // TPM_CC_PolicyPCR = 0x0000017F
         policy_hasher.update((TpmCc::PolicyPCR as u32).to_be_bytes());
 
-        // TPML_PCR_SELECTION structure
-        // count (4 bytes)
-        policy_hasher.update(1u32.to_be_bytes());
-        // TPMS_PCR_SELECTION: hash (2 bytes) + sizeOfSelect (1 byte) + pcrSelect (3 bytes)
-        policy_hasher.update((pcr_alg as u16).to_be_bytes());
-        policy_hasher.update([3u8]); // sizeOfSelect
-        policy_hasher.update(pcr_select);
+        // TPML_PCR_SELECTION (count=1, pcr_alg bank, PCRs from pcr_values)
+        policy_hasher.update(pcr_selection(&indices, pcr_alg));
 
         // PCR digest
         policy_hasher.update(pcr_digest);
@@ -433,4 +421,23 @@ impl PcrOps for Tpm {
 
         Ok(policy_digest.to_vec())
     }
+}
+
+/// Marshal a single-bank `TPML_PCR_SELECTION` (count=1) selecting `indices` in the `alg`
+/// bank: 4-byte count, 2-byte hash alg, 1-byte sizeofSelect=3, then the 3-byte select
+/// bitmap covering PCRs 0-23. Shared by callers that gate on a PCR set (derivation policy,
+/// software policy-digest calculation).
+pub(crate) fn pcr_selection(indices: &[u8], alg: TpmAlg) -> Vec<u8> {
+    let mut bitmap = [0u8; 3];
+    for &i in indices {
+        if i < 24 {
+            bitmap[(i / 8) as usize] |= 1 << (i % 8);
+        }
+    }
+    CommandBuffer::new()
+        .write_u32(1) // count
+        .write_u16(alg as u16) // hash
+        .write_u8(3) // sizeofSelect
+        .write_bytes(&bitmap)
+        .into_vec()
 }
