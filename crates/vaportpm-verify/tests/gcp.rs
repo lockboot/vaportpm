@@ -464,56 +464,84 @@ fn test_gcp_decoded_reject_invalid_der_cert() {
 /// Covers: gcp.rs — provider_from_hash returns None → "Unknown root CA"
 #[test]
 fn test_gcp_decoded_reject_unknown_root_ca() {
+    use der::asn1::{GeneralizedTime, UtcTime};
+    use der::Encode as _;
     use ecdsa::signature::hazmat::PrehashSigner;
-    use p256::pkcs8::DecodePrivateKey;
+    use rand_core::OsRng;
     use sha2::Digest;
+    use std::str::FromStr;
+    use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+    use x509_cert::name::Name;
+    use x509_cert::serial_number::SerialNumber;
+    use x509_cert::spki::SubjectPublicKeyInfoOwned;
+    use x509_cert::time::{Time, Validity};
 
-    // Generate a self-signed CA
-    let mut ca_params = rcgen::CertificateParams::new(vec!["Fake Root CA".to_string()]).unwrap();
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![
-        rcgen::KeyUsagePurpose::KeyCertSign,
-        rcgen::KeyUsagePurpose::DigitalSignature,
-    ];
-    ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "Fake Root CA");
-    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    // Wide validity so the fixed fixture verification time falls inside it (rcgen defaulted wide).
+    let validity = Validity {
+        not_before: Time::UtcTime(
+            UtcTime::from_unix_duration(Duration::from_secs(946_684_800)).unwrap(), // 2000-01-01
+        ),
+        not_after: Time::GeneralTime(
+            GeneralizedTime::from_unix_duration(Duration::from_secs(4_102_444_800)).unwrap(), // 2100
+        ),
+    };
 
-    // Generate a leaf cert signed by our fake CA
-    let mut leaf_params = rcgen::CertificateParams::new(vec!["Fake Leaf".to_string()]).unwrap();
-    leaf_params.is_ca = rcgen::IsCa::NoCa;
-    leaf_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-    leaf_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "Fake Leaf");
-    let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+    // Self-signed fake CA (P-256, proper CA + keyCertSign) and a leaf under it -- structurally valid
+    // so chain validation passes, but the root is unknown so provider lookup must reject it.
+    let ca_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let leaf_key = p256::ecdsa::SigningKey::random(&mut OsRng);
+    let ca_subject = Name::from_str("CN=Fake Root CA").unwrap();
+
+    let ca_der = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(1u32),
+        validity,
+        ca_subject.clone(),
+        SubjectPublicKeyInfoOwned::from_key(*ca_key.verifying_key()).unwrap(),
+        &ca_key,
+    )
+    .unwrap()
+    .build::<p256::ecdsa::DerSignature>()
+    .unwrap()
+    .to_der()
+    .unwrap();
+
+    let leaf_der = CertificateBuilder::new(
+        Profile::Leaf {
+            issuer: ca_subject,
+            enable_key_agreement: false,
+            enable_key_encipherment: false,
+            include_subject_key_identifier: true,
+        },
+        SerialNumber::from(2u32),
+        validity,
+        Name::from_str("CN=Fake Leaf").unwrap(),
+        SubjectPublicKeyInfoOwned::from_key(*leaf_key.verifying_key()).unwrap(),
+        &ca_key,
+    )
+    .unwrap()
+    .build::<p256::ecdsa::DerSignature>()
+    .unwrap()
+    .to_der()
+    .unwrap();
 
     // Start from the real fixture (has valid quote_attest, nonce, PCRs)
     let mut decoded = decode_gcp_amd_fixture();
 
     // Extract AK public key from the leaf signing key
-    let leaf_signing_key_for_pk =
-        p256::ecdsa::SigningKey::from_pkcs8_der(&leaf_key.serialize_der()).unwrap();
-    let ak_point = leaf_signing_key_for_pk
-        .verifying_key()
-        .to_encoded_point(false);
+    let ak_point = leaf_key.verifying_key().to_encoded_point(false);
     decoded.ak_pubkey = P256PublicKey::from_sec1_uncompressed(ak_point.as_bytes()).unwrap();
 
     // Re-sign the quote_attest with the fake leaf's private key so the
     // signature verification passes. verify_ecdsa_p256 does
     // verify_prehash(SHA-256(message)), so we sign_prehash the same digest.
-    let leaf_signing_key =
-        p256::ecdsa::SigningKey::from_pkcs8_der(&leaf_key.serialize_der()).unwrap();
     let digest = sha2::Sha256::digest(&decoded.quote_attest);
-    let signature: p256::ecdsa::Signature = leaf_signing_key.sign_prehash(&digest).unwrap();
+    let signature: p256::ecdsa::Signature = leaf_key.sign_prehash(&digest).unwrap();
     decoded.quote_signature = signature.to_der().as_bytes().to_vec();
 
     // Swap in our fake cert chain
     decoded.platform = DecodedPlatformAttestation::Gcp {
-        cert_chain_der: vec![leaf_cert.der().to_vec(), ca_cert.der().to_vec()],
+        cert_chain_der: vec![leaf_der, ca_der],
     };
 
     let result = verify_decoded_attestation_output(&decoded, gcp_amd_fixture_time());
