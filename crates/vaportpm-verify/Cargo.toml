@@ -1,6 +1,6 @@
 [package]
 name = "vaportpm-verify"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Cloud vTPM attestation verification - TPM and Nitro attestation verification"
 license.workspace = true
