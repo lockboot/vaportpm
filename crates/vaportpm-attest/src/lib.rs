@@ -30,6 +30,7 @@ use std::io::{Read, Write};
 pub mod a9n;
 #[cfg(feature = "attest")]
 pub mod cert;
+pub mod derive;
 pub mod ek;
 // NSM (AWS Nitro) attestation is reached via a TPM vendor command, so it is
 // no_std-capable and part of the attest surface (not std).
@@ -39,8 +40,10 @@ pub mod nv;
 pub mod pcr;
 #[cfg(feature = "attest")]
 pub mod roots;
+pub(crate) mod session;
 
 // Re-export extension traits for convenience
+pub use derive::DeriveOps;
 pub use ek::KeyOps;
 pub use nv::NvOps;
 pub use pcr::PcrOps;
@@ -67,6 +70,7 @@ pub use cert::StdHttpFetcher;
 pub enum TpmCc {
     PcrRead = 0x0000017E,
     PcrExtend = 0x00000182,
+    Hmac = 0x00000155,
     GetCapability = 0x0000017A,
     CreatePrimary = 0x00000131,
     Sign = 0x0000015D,
@@ -367,6 +371,18 @@ impl CommandBuffer {
             .write_u16(0) // nonce - empty
             .write_u8(0) // sessionAttributes - continue session
             .write_u16(0) // password/hmac - empty
+    }
+
+    /// Authorization area referencing a policy `session` (empty nonce, continueSession,
+    /// empty caller HMAC). Same 9-byte shape as the password area, with the policy
+    /// session handle in place of `TPM_RS_PW`.
+    #[allow(dead_code)]
+    fn write_auth_policy_session(self, session: u32) -> Self {
+        self.write_u32(9) // authorizationSize
+            .write_u32(session) // sessionHandle - policy session
+            .write_u16(0) // nonceCaller - empty
+            .write_u8(0x01) // sessionAttributes - continueSession
+            .write_u16(0) // hmac - empty
     }
 
     fn finalize(mut self, tag: TpmSt, code: TpmCc) -> Vec<u8> {
