@@ -16,6 +16,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cert::{der_to_pem, fetch_cert_chain, CertFetcher, DER_SEQUENCE_LONG};
+use crate::gpt::GptDigests;
 use crate::{KeyOps, NsmOps, NvOps, PcrOps, PublicKey, Tpm, TPM_RH_ENDORSEMENT};
 
 /// GCP AK certificate NV index (ECC)
@@ -41,6 +42,11 @@ pub struct AttestationOutput {
     /// Attestation Key public keys (hex-encoded ECC coordinates)
     pub ak_pubkeys: BTreeMap<String, EccPublicKeyCoords>,
     pub attestation: AttestationContainer,
+    /// The boot disk's `H(UEFI_GPT_DATA)` in each bank, read from the disk when the
+    /// attestation was made. Not covered by the quote: it is input for replaying the PCR the
+    /// firmware's `EV_EFI_GPT_EVENT` extended (PCR5, or PCR2 on GCE TDX), which the quote does
+    /// cover. Present whether or not the platform measures the GPT.
+    pub gpt: GptDigests,
 }
 
 /// ECC public key coordinates
@@ -117,6 +123,7 @@ fn is_gcp_tpm(tpm: &mut Tpm) -> bool {
 ///
 /// # Arguments
 /// * `nonce` - User-provided nonce/challenge to include in attestation
+/// * `gpt` - The boot disk's GPT digests, carried as replay input (see [`AttestationOutput::gpt`])
 ///
 /// # Returns
 /// JSON-encoded attestation document containing all attestation data
@@ -126,7 +133,12 @@ fn is_gcp_tpm(tpm: &mut Tpm) -> bool {
 /// Produce the unified attestation JSON for an already-open TPM, using `fetcher` to
 /// retrieve any AIA intermediate certificates. no_std + alloc: a UEFI caller passes a
 /// `Tpm` over EFI_TCG2 and a `CertFetcher` over EFI_TCP4.
-pub fn attest_with(tpm: &mut Tpm, nonce: &[u8], fetcher: &dyn CertFetcher) -> Result<String> {
+pub fn attest_with(
+    tpm: &mut Tpm,
+    nonce: &[u8],
+    gpt: &GptDigests,
+    fetcher: &dyn CertFetcher,
+) -> Result<String> {
     // Step 1: Detect platform
     // GCP detection is cheap - just checks for NV index existence
     let is_nitro = tpm.is_nitro_tpm()?;
@@ -221,6 +233,7 @@ pub fn attest_with(tpm: &mut Tpm, nonce: &[u8], fetcher: &dyn CertFetcher) -> Re
         pcrs: pcrs_by_alg,
         ak_pubkeys: signing_key_public_keys,
         attestation,
+        gpt: gpt.clone(),
     };
 
     let json = serde_json::to_string_pretty(&output)?;
@@ -228,11 +241,12 @@ pub fn attest_with(tpm: &mut Tpm, nonce: &[u8], fetcher: &dyn CertFetcher) -> Re
     Ok(json)
 }
 
-/// Convenience std entrypoint: open /dev/tpm0 and use the built-in HTTP fetcher.
+/// Convenience std entrypoint: open /dev/tpm0 and use the built-in HTTP fetcher. `gpt` is
+/// the boot disk's ([`GptDigests::read_device`]).
 #[cfg(feature = "http-fetch")]
-pub fn attest(nonce: &[u8]) -> Result<String> {
+pub fn attest(nonce: &[u8], gpt: &GptDigests) -> Result<String> {
     let mut tpm = Tpm::open_direct()?;
-    attest_with(&mut tpm, nonce, &crate::cert::StdHttpFetcher)
+    attest_with(&mut tpm, nonce, gpt, &crate::cert::StdHttpFetcher)
 }
 
 /// Nitro attestation path: create restricted AK and use TPM2_Quote
