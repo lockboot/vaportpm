@@ -28,10 +28,13 @@ use std::io::{Read, Write};
 // Attestation surface (quote + cert chain + JSON). no_std + alloc; gated by `attest`.
 #[cfg(feature = "attest")]
 pub mod a9n;
+#[cfg(feature = "std")]
+pub mod bootdisk;
 #[cfg(feature = "attest")]
 pub mod cert;
 pub mod derive;
 pub mod ek;
+pub mod gpt;
 // NSM (AWS Nitro) attestation is reached via a TPM vendor command, so it is
 // no_std-capable and part of the attest surface (not std).
 #[cfg(feature = "attest")]
@@ -45,6 +48,7 @@ pub(crate) mod session;
 // Re-export extension traits for convenience
 pub use derive::DeriveOps;
 pub use ek::KeyOps;
+pub use gpt::GptDigests;
 pub use nv::NvOps;
 pub use pcr::PcrOps;
 

@@ -3,9 +3,11 @@
 Produces a self-contained attestation document from a cloud vTPM. The output can be verified offline using [`vaportpm-verify`](../vaportpm-verify/).
 
 ```rust
-use vaportpm_attest::attest;
+use vaportpm_attest::{attest, bootdisk, GptDigests};
 
-let json = attest(nonce)?;
+let disk = bootdisk::boot_disk()?; // the one disk with an EFI System Partition
+let gpt = GptDigests::read_device(&disk)?;
+let json = attest(nonce, &gpt)?;
 // Send json to verifier
 ```
 
@@ -13,6 +15,7 @@ The library auto-detects the cloud platform (AWS Nitro, GCP Confidential VM) and
 - TPM2_Quote (signed PCR values)
 - Platform-specific trust chain (Nitro document or GCP AK certificate)
 - PCR values and nonce for verification
+- The boot disk's GPT digests (`H(UEFI_GPT_DATA)`, sha256 and sha384), read from the disk. Not covered by the quote: they are input for replaying the PCR the firmware's `EV_EFI_GPT_EVENT` extended (PCR5; PCR2 on GCE TDX), and the replayed value is compared with the quoted one. This needs no firmware event log.
 
 ---
 

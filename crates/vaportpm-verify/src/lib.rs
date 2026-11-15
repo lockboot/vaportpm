@@ -134,6 +134,7 @@ pub use vaportpm_attest::a9n::{
     AttestationContainer, AttestationData, AttestationOutput, EccPublicKeyCoords,
     GcpAttestationData, NitroAttestationData,
 };
+pub use vaportpm_attest::GptDigests;
 
 /// Binary attestation data - all fields already decoded from hex/PEM
 ///
@@ -450,6 +451,10 @@ mod tests {
                 tpm: std::collections::BTreeMap::new(),
                 nitro: None,
                 gcp: None,
+            },
+            gpt: vaportpm_attest::GptDigests {
+                sha256: [0; 32],
+                sha384: [0; 48],
             },
         };
 
