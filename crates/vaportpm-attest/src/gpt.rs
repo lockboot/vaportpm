@@ -17,6 +17,10 @@ use sha2::{Digest, Sha256, Sha384};
 
 /// `sizeof(EFI_PARTITION_TABLE_HEADER)`: what EDK2 copies into `UEFI_GPT_DATA`.
 const GPT_HEADER_SIZE: usize = 92;
+/// Largest partition entry array read (NumberOfPartitionEntries * SizeOfPartitionEntry):
+/// 4x the usual 128 x 128 bytes. The header is untrusted (any attached disk), and the spec
+/// sets no maximum.
+const MAX_ENTRY_ARRAY: usize = 64 * 1024;
 
 /// `H(UEFI_GPT_DATA)` in each bank an attestation may quote.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,8 +100,17 @@ pub fn uefi_gpt_data(
     if size < 16 {
         bail!("GPT SizeOfPartitionEntry {size} is too small");
     }
-    let mut entries = vec![0u8; count * size];
-    read_at(entry_lba * sector, &mut entries)?;
+    let len = count
+        .checked_mul(size)
+        .filter(|&n| n <= MAX_ENTRY_ARRAY)
+        .ok_or_else(|| {
+            anyhow::anyhow!("GPT entry array {count} x {size} exceeds {MAX_ENTRY_ARRAY} bytes")
+        })?;
+    let offset = entry_lba
+        .checked_mul(sector)
+        .ok_or_else(|| anyhow::anyhow!("GPT PartitionEntryLBA {entry_lba} out of range"))?;
+    let mut entries = vec![0u8; len];
+    read_at(offset, &mut entries)?;
     let used: Vec<&[u8]> = entries
         .chunks_exact(size)
         .filter(|e| e[..16] != [0u8; 16])
@@ -210,6 +223,16 @@ mod tests {
                  37fd3f4092336183b47fdb639842bfa3"
             );
         }
+    }
+
+    #[test]
+    fn rejects_oversized_entry_array() {
+        let mut d = disk(512);
+        d[512 + 80..512 + 84].copy_from_slice(&513u32.to_le_bytes()); // 513 x 128 > 64 KiB
+        assert!(read(&d, 512).is_err());
+        d[512 + 72..512 + 80].copy_from_slice(&u64::MAX.to_le_bytes()); // LBA overflow
+        d[512 + 80..512 + 84].copy_from_slice(&4u32.to_le_bytes());
+        assert!(read(&d, 512).is_err());
     }
 
     #[test]

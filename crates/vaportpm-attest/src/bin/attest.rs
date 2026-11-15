@@ -3,14 +3,15 @@
 //! vaportpm-attest — TPM attestation and PCR-bound key derivation
 //!
 //! Usage:
-//!   vaportpm-attest attest <DISK> [NONCE_HEX]
-//!                                        Attestation (JSON to stdout); DISK is the boot
-//!                                        disk, whose GPT digests the attestation carries
+//!   vaportpm-attest attest [--disk <DISK>] [NONCE_HEX]
+//!                                        Attestation (JSON to stdout), carrying the boot
+//!                                        disk's GPT digests: DISK, else the one disk
+//!                                        with an EFI System Partition
 //!   vaportpm-attest derive <LABEL> <LEN> [--exclude <PCRS>]
 //!                                        PCR-bound key derivation (hex to stdout)
 //!
 //! Attestation nonce is determined by (in order of priority):
-//! 1. Argument after DISK (hex-encoded)
+//! 1. Argument after "attest" (hex-encoded)
 //! 2. Stdin if not a tty (hex-encoded, whitespace trimmed)
 //! 3. Random 32-byte nonce
 //!
@@ -23,7 +24,7 @@
 use std::io::{self, IsTerminal, Read};
 use std::path::Path;
 use std::process::ExitCode;
-use vaportpm_attest::{attest, DeriveOps, GptDigests, Tpm};
+use vaportpm_attest::{attest, bootdisk, DeriveOps, GptDigests, Tpm};
 
 const ALL_PCRS: &[u8] = &[
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
@@ -37,7 +38,7 @@ fn main() -> ExitCode {
         Some("derive") => cmd_derive(&args[2..]),
         _ => {
             eprintln!("usage: vaportpm-attest <attest|derive>");
-            eprintln!("  attest <DISK> [NONCE_HEX]");
+            eprintln!("  attest [--disk <DISK>] [NONCE_HEX]");
             eprintln!("                         Generate TPM attestation (JSON to stdout)");
             eprintln!("  derive <LABEL> <LEN> [--exclude <PCRS>]");
             eprintln!("                         PCR-bound key derivation (hex to stdout)");
@@ -47,18 +48,42 @@ fn main() -> ExitCode {
 }
 
 fn cmd_attest(args: &[String]) -> ExitCode {
-    let Some(disk) = args.first() else {
-        eprintln!("usage: vaportpm-attest attest <DISK> [NONCE_HEX]");
-        return ExitCode::FAILURE;
+    let (disk, rest) = match args {
+        [flag, disk, rest @ ..] if flag == "--disk" => (Some(Path::new(disk).to_path_buf()), rest),
+        [flag] if flag == "--disk" => {
+            eprintln!("usage: vaportpm-attest attest [--disk <DISK>] [NONCE_HEX]");
+            return ExitCode::FAILURE;
+        }
+        rest => (None, rest),
     };
-    let gpt = match GptDigests::read_device(Path::new(disk)) {
+    if rest.len() > 1 {
+        eprintln!("usage: vaportpm-attest attest [--disk <DISK>] [NONCE_HEX]");
+        return ExitCode::FAILURE;
+    }
+    let disk = match disk {
+        Some(d) => d,
+        None => match bootdisk::boot_disk() {
+            Ok(d) => {
+                eprintln!("boot disk {}", d.display());
+                d
+            }
+            Err(e) => {
+                eprintln!(
+                    "error: finding the boot disk: {:#} (name it with --disk)",
+                    e
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let gpt = match GptDigests::read_device(&disk) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("error: GPT of {}: {:#}", disk, e);
+            eprintln!("error: GPT of {}: {:#}", disk.display(), e);
             return ExitCode::FAILURE;
         }
     };
-    let nonce = match get_nonce(&args[1..]) {
+    let nonce = match get_nonce(rest) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("error: {}", e);

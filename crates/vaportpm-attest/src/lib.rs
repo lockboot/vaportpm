@@ -28,6 +28,8 @@ use std::io::{Read, Write};
 // Attestation surface (quote + cert chain + JSON). no_std + alloc; gated by `attest`.
 #[cfg(feature = "attest")]
 pub mod a9n;
+#[cfg(feature = "std")]
+pub mod bootdisk;
 #[cfg(feature = "attest")]
 pub mod cert;
 pub mod derive;

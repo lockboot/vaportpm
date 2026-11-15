@@ -3,9 +3,10 @@
 Produces a self-contained attestation document from a cloud vTPM. The output can be verified offline using [`vaportpm-verify`](../vaportpm-verify/).
 
 ```rust
-use vaportpm_attest::{attest, GptDigests};
+use vaportpm_attest::{attest, bootdisk, GptDigests};
 
-let gpt = GptDigests::read_device(Path::new("/dev/nvme0n1"))?; // the boot disk
+let disk = bootdisk::boot_disk()?; // the one disk with an EFI System Partition
+let gpt = GptDigests::read_device(&disk)?;
 let json = attest(nonce, &gpt)?;
 // Send json to verifier
 ```
