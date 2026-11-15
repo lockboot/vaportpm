@@ -3,6 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+    # Release: a v* tag builds, attests and publishes the static musl binaries
+    # (procedure: workspace RELEASING.md).
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -23,3 +26,75 @@ jobs:
 
       - name: Release build
         run: make build
+
+  # Static musl vaportpm-attest + vaportpm-verify, on every push/PR/tag. Byte-identical to a
+  # local `make release-x86` / `make release-aarch64`.
+  build:
+    name: build-${{ matrix.arch }}
+    needs: ci
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, target: release-x86 }
+          - { arch: aarch64, target: release-aarch64 }
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Build static musl binaries for ${{ matrix.arch }}
+        run: make ${{ matrix.target }}
+
+      - name: Name them by arch
+        run: |
+          mkdir dist
+          for bin in vaportpm-attest vaportpm-verify; do
+            cp "target/${{ matrix.arch }}-unknown-linux-musl/release/$bin" "dist/$bin-${{ matrix.arch }}-linux-musl"
+          done
+          sha256sum dist/*
+
+      - name: Upload binaries for ${{ matrix.arch }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vaportpm-${{ matrix.arch }}
+          path: dist/*
+
+  # ---- release (tag: v*) ------------------------------------------------
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vaportpm-*
+          path: dist
+          merge-multiple: true
+
+      - name: List attestation subjects
+        run: (cd dist && sha256sum * | tee ../subjects.sha256)
+
+      # One build-provenance attestation over the four binaries:
+      # `gh attestation verify <binary> --repo lockboot/vaportpm`.
+      - name: Attest binaries
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-checksums: subjects.sha256
+
+      # Immutable once published (repo setting, workspace tools/rulesets.sh).
+      - name: Create release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: dist/*
+          draft: false
+          prerelease: true
+          generate_release_notes: true
+          make_latest: true

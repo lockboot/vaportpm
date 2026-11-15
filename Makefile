@@ -1,4 +1,4 @@
-.PHONY: all build release-x86 release-aarch64 check test fmt fmt-check clippy doc clean ci \
+.PHONY: all lock build release-x86 release-aarch64 check test fmt fmt-check clippy doc clean ci \
 	setup-coverage coverage-html coverage-text
 
 # Shared build harness (docker images + DOCKER_RUN plumbing). Vendored byte-identically from
@@ -13,20 +13,24 @@ CARGO = $(DOCKER_RUN) $(DOCKER_SAMEUSER) $(BUILD_IMAGE) cargo
 
 all: build
 
+# Re-resolve Cargo.lock from scratch (every other target builds --locked).
+lock: docker-build-base
+	$(CARGO) generate-lockfile
+
 build: docker-build-base
-	$(CARGO) build --workspace --release
+	$(CARGO) build --workspace --locked --release
 
 release-x86: docker-build-base
-	$(CARGO) build --workspace --release --target x86_64-unknown-linux-musl
+	$(CARGO) build --workspace --locked --release --target x86_64-unknown-linux-musl
 
 release-aarch64: docker-build-base
-	$(CARGO) build --workspace --release --target aarch64-unknown-linux-musl
+	$(CARGO) build --workspace --locked --release --target aarch64-unknown-linux-musl
 
 check: docker-build-base
-	$(CARGO) check --workspace --all-targets
+	$(CARGO) check --workspace --locked --all-targets
 
 test: docker-build-base
-	$(CARGO) test --workspace
+	$(CARGO) test --workspace --locked
 
 fmt: docker-build-base
 	$(CARGO) fmt --all
@@ -35,7 +39,7 @@ fmt-check: docker-build-base
 	$(CARGO) fmt --all -- --check
 
 clippy: docker-build-base
-	$(CARGO) clippy --workspace --all-targets -- -D warnings
+	$(CARGO) clippy --workspace --locked --all-targets -- -D warnings
 
 doc: docker-build-base
 	$(DOCKER_RUN) $(DOCKER_SAMEUSER) -e RUSTDOCFLAGS="-D warnings" $(BUILD_IMAGE) cargo doc --workspace --no-deps
