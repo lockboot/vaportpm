@@ -713,7 +713,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "vaportpm-attest"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "vaportpm-verify"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64",
  "ciborium",
